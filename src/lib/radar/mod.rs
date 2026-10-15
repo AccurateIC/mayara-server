@@ -14,13 +14,13 @@ use std::{
     fmt::{self, Display, Write},
     net::{Ipv4Addr, SocketAddrV4},
     sync::{
-        Arc, LazyLock, RwLock,
+        Arc, LazyLock, Mutex, RwLock,
         atomic::{AtomicBool, Ordering},
     },
 };
 use thiserror::Error;
 use tokio::sync::{broadcast, mpsc};
-use tokio_graceful_shutdown::{SubsystemBuilder, SubsystemHandle};
+use tokio_graceful_shutdown::{NestedSubsystem, SubsystemBuilder, SubsystemHandle};
 use utoipa::ToSchema;
 
 pub mod cpa;
@@ -373,6 +373,25 @@ fn now_millis() -> u64 {
     RADAR_EPOCH.elapsed().as_millis() as u64
 }
 
+/// The subsystems serving one radar, so that forgetting the radar stops them
+/// too. Shared via `Arc` so every clone of a `RadarInfo` sees the same list.
+#[derive(Clone, Default)]
+struct RadarTasks(Arc<Mutex<Vec<NestedSubsystem>>>);
+
+impl RadarTasks {
+    /// Whether both belong to the same registration of a radar: every clone of
+    /// one `RadarInfo` shares the list, a radar registered anew gets its own.
+    fn is_same(&self, other: &RadarTasks) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl fmt::Debug for RadarTasks {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "RadarTasks({})", self.0.lock().unwrap().len())
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct RadarInfo {
     key: String,
@@ -454,6 +473,9 @@ pub struct RadarInfo {
     /// of every range. Decided per antenna by the watchdog
     /// (`SharedRadars::refresh_stand_down`), read via `stand_down()`.
     stand_down: Arc<AtomicBool>,
+
+    /// The subsystems started for this radar; see [`track_task`](Self::track_task).
+    tasks: RadarTasks,
 }
 
 /// Number of trailing characters of an identity that make a radar
@@ -627,6 +649,7 @@ impl RadarInfo {
             // auto-standby period after discovery, not at once.
             last_watched: Arc::new(AtomicU64::new(now_millis())),
             stand_down: Arc::new(AtomicBool::new(false)),
+            tasks: RadarTasks::default(),
         };
 
         log::trace!("Created RadarInfo {:?}", info);
@@ -681,6 +704,19 @@ impl RadarInfo {
     /// How long it has been since the last packet was received from this radar.
     pub(crate) fn input_silence(&self) -> Duration {
         Duration::from_millis(now_millis().saturating_sub(self.last_input.load(Ordering::Relaxed)))
+    }
+
+    /// Tie a subsystem serving this radar to the radar's lifetime: removing
+    /// the radar shuts it down, so a radar found again later does not end up
+    /// with two receivers.
+    pub(crate) fn track_task(&self, task: NestedSubsystem) {
+        self.tasks.0.lock().unwrap().push(task);
+    }
+
+    fn stop_tasks(&self) {
+        for task in self.tasks.0.lock().unwrap().drain(..) {
+            task.initiate_shutdown();
+        }
     }
 
     fn mark_watched_at(&self, now: u64) {
@@ -875,10 +911,10 @@ impl RadarInfo {
         if self.output {
             let info_clone2 = self.clone();
 
-            subsys.start(SubsystemBuilder::new(
+            self.track_task(subsys.start(SubsystemBuilder::new(
                 "stdout",
                 async move |s: &mut SubsystemHandle| info_clone2.forward_output(s).await,
-            ));
+            )));
         }
     }
 
@@ -1048,15 +1084,19 @@ impl SharedRadars {
             .ensure_install_id()
     }
 
-    ///
-    /// Update radar info in radars container
-    ///
+    /// Store a change to a registered radar. Only the registration currently
+    /// held under the radar's key is changed: a receiver still winding down
+    /// after its radar was forgotten, or replaced under the same key, must not
+    /// bring its stale copy back.
     pub fn update(&self, radar_info: &mut RadarInfo) {
         let mut radars = self.radars.write().unwrap();
 
-        radars
-            .info
-            .insert(radar_info.key.clone(), radar_info.clone());
+        match radars.info.get_mut(&radar_info.key) {
+            Some(current) if current.tasks.is_same(&radar_info.tasks) => {
+                *current = radar_info.clone();
+            }
+            _ => return,
+        }
 
         radars.persistent_data.store(radar_info);
     }
@@ -1112,8 +1152,9 @@ impl SharedRadars {
             let Some(reachable) =
                 crate::network::can_reach(&info.nic_addr, &info.send_command_addr)
             else {
-                // The interface went away, or the route leads somewhere we
-                // cannot identify; say nothing rather than guess.
+                // The route leads somewhere we cannot identify; say nothing
+                // rather than guess. An interface address that went away is
+                // the locator's to handle: it forgets the radar.
                 continue;
             };
             let ifname = crate::network::interface_for(&info.nic_addr)
@@ -1291,9 +1332,50 @@ impl SharedRadars {
     }
 
     pub fn remove(&self, key: &str) {
-        let mut radars = self.radars.write().unwrap();
+        let removed = self.radars.write().unwrap().info.remove(key);
+        if let Some(info) = removed {
+            info.stop_tasks();
+        }
+    }
 
-        radars.info.remove(key);
+    /// Tie a subsystem serving the radar `key` to that radar's lifetime; see
+    /// [`RadarInfo::track_task`]. A radar already forgotten has nothing left
+    /// to serve, so its subsystem is stopped at once.
+    pub(crate) fn track_task(&self, key: &str, task: NestedSubsystem) {
+        match self.radars.read().unwrap().info.get(key) {
+            Some(info) => info.track_task(task),
+            None => task.initiate_shutdown(),
+        }
+    }
+
+    /// Forget every radar found via an interface address this host no longer
+    /// has, returning their keys. Such a radar can never be reached again: its
+    /// receiver binds to that address. Forgetting it lets discovery find it
+    /// anew on whatever address the host has now.
+    pub(crate) fn remove_radars_without_address(
+        &self,
+        host_has: impl Fn(&Ipv4Addr) -> bool,
+    ) -> Vec<String> {
+        // Select and remove under one lock, so a radar that replaces a lost
+        // one under the same key in between is not removed in its place.
+        let lost: Vec<RadarInfo> = {
+            let mut radars = self.radars.write().unwrap();
+            let keys: Vec<String> = radars
+                .info
+                .values()
+                .filter(|info| !host_has(&info.nic_addr))
+                .map(|info| info.key.clone())
+                .collect();
+            keys.iter()
+                .filter_map(|key| radars.info.remove(key))
+                .collect()
+        };
+        lost.into_iter()
+            .map(|info| {
+                info.stop_tasks();
+                info.key
+            })
+            .collect()
     }
 
     ///
@@ -2967,6 +3049,133 @@ mod tests {
             (Some(PERIOD), PERIOD * 10),
             (Some(PERIOD * 5), PERIOD * 5)
         ]));
+    }
+
+    #[test]
+    fn radars_on_a_lost_address_are_forgotten() {
+        let radars = SharedRadars::new();
+        let kept = radars
+            .add(test_helpers::radar_info(&radars, "0001", None))
+            .unwrap();
+        let mut lost = test_helpers::radar_info(&radars, "0002", None);
+        lost.nic_addr = Ipv4Addr::new(223, 168, 1, 100);
+        let lost = radars.add(lost).unwrap();
+
+        let forgotten = radars.remove_radars_without_address(|addr| *addr == kept.nic_addr);
+
+        assert_eq!(forgotten, vec![lost.key()]);
+        assert!(radars.get_by_key(&kept.key()).is_some());
+        assert!(radars.get_by_key(&lost.key()).is_none());
+    }
+
+    #[test]
+    fn an_update_changes_the_registered_radar() {
+        let radars = SharedRadars::new();
+        let mut info = radars
+            .add(test_helpers::radar_info(&radars, "0004", None))
+            .unwrap();
+        // Storing the radar saves its name, which a locator always sets.
+        info.controls.set_user_name("Radar".to_string());
+
+        info.serial_no = Some("changed".to_string());
+        radars.update(&mut info);
+
+        let stored = radars.get_by_key(&info.key()).unwrap();
+        assert_eq!(stored.serial_no.as_deref(), Some("changed"));
+    }
+
+    /// A receiver still winding down after its radar was forgotten must not
+    /// list the radar again.
+    #[test]
+    fn an_update_does_not_bring_back_a_forgotten_radar() {
+        let radars = SharedRadars::new();
+        let mut info = radars
+            .add(test_helpers::radar_info(&radars, "0005", None))
+            .unwrap();
+        radars.remove(&info.key());
+
+        radars.update(&mut info);
+
+        assert!(radars.get_by_key(&info.key()).is_none());
+    }
+
+    /// Once a radar is registered anew under the same key, the old
+    /// registration's receiver must not overwrite it.
+    #[test]
+    fn an_update_from_an_older_registration_is_ignored() {
+        let radars = SharedRadars::new();
+        let mut old = radars
+            .add(test_helpers::radar_info(&radars, "0006", None))
+            .unwrap();
+        radars.remove(&old.key());
+        let current = radars
+            .add(test_helpers::radar_info(&radars, "0006", None))
+            .unwrap();
+
+        old.serial_no = Some("stale".to_string());
+        radars.update(&mut old);
+
+        let stored = radars.get_by_key(&current.key()).unwrap();
+        assert_ne!(stored.serial_no.as_deref(), Some("stale"));
+    }
+
+    /// Start a subsystem that reports, through the returned receiver, when it
+    /// is asked to shut down.
+    fn start_task_watching_shutdown(
+        subsys: &SubsystemHandle,
+    ) -> (NestedSubsystem, tokio::sync::oneshot::Receiver<()>) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let task = subsys.start(SubsystemBuilder::new(
+            "task",
+            async move |s: &mut SubsystemHandle| {
+                s.on_shutdown_requested().await;
+                let _ = tx.send(());
+                Ok::<(), RadarError>(())
+            },
+        ));
+        (task, rx)
+    }
+
+    async fn stopped(rx: tokio::sync::oneshot::Receiver<()>) -> bool {
+        tokio::time::timeout(Duration::from_secs(1), rx)
+            .await
+            .is_ok_and(|received| received.is_ok())
+    }
+
+    #[tokio::test]
+    async fn removing_a_radar_stops_its_tasks() {
+        tokio_graceful_shutdown::Toplevel::new(async |subsys: &mut SubsystemHandle| {
+            let radars = SharedRadars::new();
+            let info = radars
+                .add(test_helpers::radar_info(&radars, "0003", None))
+                .unwrap();
+            let (task, rx) = start_task_watching_shutdown(subsys);
+            radars.track_task(&info.key(), task);
+
+            radars.remove(&info.key());
+
+            assert!(stopped(rx).await, "the radar's task was not stopped");
+            subsys.request_shutdown();
+        })
+        .handle_shutdown_requests(Duration::from_secs(1))
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_task_for_a_forgotten_radar_stops_at_once() {
+        tokio_graceful_shutdown::Toplevel::new(async |subsys: &mut SubsystemHandle| {
+            let radars = SharedRadars::new();
+            let (task, rx) = start_task_watching_shutdown(subsys);
+
+            radars.track_task("gone", task);
+
+            assert!(stopped(rx).await, "the task outlived its radar");
+            subsys.request_shutdown();
+        })
+        .handle_shutdown_requests(Duration::from_secs(1))
+        .await
+        .unwrap();
     }
 
     #[test]
