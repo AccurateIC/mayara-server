@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 use tokio_graceful_shutdown::{SubsystemBuilder, SubsystemHandle};
 
 use crate::locator::LocatorAddress;
+use crate::network::{interface_for, match_ipv4};
 use crate::radar::{RadarInfo, SharedRadars};
 use crate::util::PrintableSlice;
 use crate::{Brand, Cli};
@@ -72,6 +73,9 @@ struct KodenLocator {
     /// in time. Nothing re-keys a registered radar, so the decision has
     /// to stand for the session.
     settled: HashSet<Ipv4Addr>,
+    /// The netmask of each interface address a radar was heard via, looked
+    /// up once: image frames arrive continuously.
+    netmasks: HashMap<Ipv4Addr, Option<Ipv4Addr>>,
 }
 
 impl RadarLocator for KodenLocator {
@@ -98,7 +102,20 @@ impl KodenLocator {
             macs: HashMap::new(),
             asked: HashMap::new(),
             settled: HashSet::new(),
+            netmasks: HashMap::new(),
         }
+    }
+
+    /// Whether `nic_addr` is on the radar's subnet. The radar broadcasts to
+    /// 255.255.255.255, which every interface's socket hears, each tagged
+    /// with its own address; commands go back by unicast, so only an address
+    /// on the radar's subnet can reach it.
+    fn heard_on_radar_subnet(&mut self, nic_addr: &Ipv4Addr, radar_addr: &Ipv4Addr) -> bool {
+        let netmask = *self
+            .netmasks
+            .entry(*nic_addr)
+            .or_insert_with(|| interface_for(nic_addr).map(|(_, netmask)| netmask));
+        on_radar_subnet(nic_addr, radar_addr, netmask)
     }
 
     /// Record the MAC from a `0xA7` response. Returns whether it was new,
@@ -205,6 +222,10 @@ impl KodenLocator {
         if !is_koden {
             return Ok(());
         }
+        // A replay has no real interface to compare with.
+        if !self.args.is_replay() && !self.heard_on_radar_subnet(nic_addr, from.ip()) {
+            return Ok(());
+        }
 
         if first == STATUS_PREFIX
             && report[1] == CMD_MAC_ADDRESS
@@ -224,33 +245,25 @@ impl KodenLocator {
         Ok(())
     }
 
-    fn found(
-        &mut self,
+    /// The radar as it is registered: named after its key until the user
+    /// renames it, as every caller of `user_name()` expects a name.
+    fn radar_info(
+        &self,
+        radars: &SharedRadars,
         radar_addr: SocketAddrV4,
         nic_addr: Ipv4Addr,
-        radars: &SharedRadars,
-        subsys: &SubsystemHandle,
-    ) {
+        hardware_id: Option<&str>,
+    ) -> RadarInfo {
         let spoke_data_addr = SocketAddrV4::new(*radar_addr.ip(), RADAR_PORT);
         let report_addr = SocketAddrV4::new(*radar_addr.ip(), RADAR_PORT);
         let send_command_addr = SocketAddrV4::new(*radar_addr.ip(), RADAR_PORT);
-
-        let hardware_id = match self.identity_for(&radar_addr) {
-            Identity::Known(mac) => Some(mac),
-            Identity::Ask => {
-                request_mac(&radar_addr);
-                return;
-            }
-            Identity::Wait => return,
-            Identity::UseAddress => None,
-        };
 
         let radar_info = RadarInfo::new(
             radars,
             &self.args,
             Brand::Koden,
             None, // serial number discovered later
-            hardware_id.as_deref(),
+            hardware_id,
             None, // no dual range
             PIXEL_VALUES,
             SPOKES,
@@ -264,6 +277,27 @@ impl KodenLocator {
             false, // no doppler
             false, // not sparse spokes
         );
+        radar_info.controls.set_user_name(radar_info.key());
+        radar_info
+    }
+
+    fn found(
+        &mut self,
+        radar_addr: SocketAddrV4,
+        nic_addr: Ipv4Addr,
+        radars: &SharedRadars,
+        subsys: &SubsystemHandle,
+    ) {
+        let hardware_id = match self.identity_for(&radar_addr) {
+            Identity::Known(mac) => Some(mac),
+            Identity::Ask => {
+                request_mac(&radar_addr);
+                return;
+            }
+            Identity::Wait => return,
+            Identity::UseAddress => None,
+        };
+        let radar_info = self.radar_info(radars, radar_addr, nic_addr, hardware_id.as_deref());
 
         if let Some(info) = radars.add(radar_info) {
             let report_name = info.key();
@@ -292,6 +326,13 @@ pub(super) fn new(args: &Cli, addresses: &mut Vec<LocatorAddress>) {
             Box::new(KodenLocator::new(args.clone())),
         ));
     }
+}
+
+/// Whether `nic_addr` is on `radar_addr`'s subnet, given the netmask of the
+/// interface carrying `nic_addr`. Without one, as for an address that belongs
+/// to no interface, nothing can be concluded and the radar is accepted.
+fn on_radar_subnet(nic_addr: &Ipv4Addr, radar_addr: &Ipv4Addr, netmask: Option<Ipv4Addr>) -> bool {
+    netmask.is_none_or(|netmask| match_ipv4(nic_addr, radar_addr, &netmask))
 }
 
 /// Ask a radar for its MAC address. Fire-and-forget: the answer arrives
@@ -505,5 +546,39 @@ mod tests {
             );
         }
         assert!(!locator.asked.contains_key(&RADAR), "nothing left to chase");
+    }
+
+    /// Every caller of `user_name()` expects a name, so a radar registered
+    /// without one would panic the first of them.
+    #[test]
+    fn a_registered_radar_is_named_after_its_key() {
+        let info = locator().radar_info(
+            &SharedRadars::new(),
+            SocketAddrV4::new(RADAR, RADAR_PORT),
+            Ipv4Addr::new(172, 31, 3, 1),
+            None,
+        );
+        assert_eq!(info.controls.user_name(), info.key());
+    }
+
+    #[test]
+    fn a_radar_is_accepted_on_its_own_subnet_only() {
+        let netmask = Some(Ipv4Addr::new(255, 255, 0, 0));
+        assert!(on_radar_subnet(
+            &Ipv4Addr::new(172, 31, 0, 1),
+            &RADAR,
+            netmask
+        ));
+        assert!(!on_radar_subnet(
+            &Ipv4Addr::new(10, 56, 0, 4),
+            &RADAR,
+            netmask
+        ));
+    }
+
+    /// An address on no interface, so with no netmask, cannot rule a radar out.
+    #[test]
+    fn without_a_netmask_the_radar_is_accepted() {
+        assert!(on_radar_subnet(&Ipv4Addr::new(10, 56, 0, 4), &RADAR, None));
     }
 }
