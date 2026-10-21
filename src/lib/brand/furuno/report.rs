@@ -154,7 +154,15 @@ pub(crate) struct FurunoReportReceiver {
 }
 
 impl FurunoReportReceiver {
-    pub(crate) fn new(args: &Cli, radars: SharedRadars, info: RadarInfo) -> FurunoReportReceiver {
+    /// `announced` is the model the radar's beacon names. It is passed in
+    /// rather than read back from `info`, where saved settings may have
+    /// replaced it with the model a previous run identified.
+    pub(crate) fn new(
+        args: &Cli,
+        radars: SharedRadars,
+        info: RadarInfo,
+        announced: RadarModel,
+    ) -> FurunoReportReceiver {
         let key = info.key();
         let command_sender = if args.is_replay() {
             None
@@ -162,13 +170,17 @@ impl FurunoReportReceiver {
             Some(Command::new(&info, false))
         };
 
-        // In replay mode the model is already set on RadarInfo by mod.rs.
-        // In live mode, model_name may not be set yet (identified later via $N96).
-        let model_name = info.controls.model_name();
-        let model = model_name
-            .as_deref()
-            .map(RadarModel::from_model_name)
-            .unwrap_or(RadarModel::Unknown);
+        // A beacon name mayara does not recognise falls back to the model a
+        // previous run saved; in live mode `$N96` identifies it later.
+        let model = match announced {
+            RadarModel::Unknown => info
+                .controls
+                .model_name()
+                .as_deref()
+                .map(RadarModel::from_model_name)
+                .unwrap_or(RadarModel::Unknown),
+            announced => announced,
+        };
         let low_power = model.is_low_power();
         let initial_lut = Self::wire_to_legend(&info.get_legend(), DopplerWireMode::Off, low_power);
         let wire_to_legend = [initial_lut, initial_lut];
@@ -1293,6 +1305,7 @@ impl FurunoReportReceiver {
         self.model_known = true; // We set this even if we can't parse the model, there is no point in logging errors many times.
 
         if let Some((model, version)) = model_and_version(values) {
+            let model = model.as_announced(self.model);
             log::info!(
                 "{}: Radar model {} version {}",
                 self.common.key,
@@ -2313,7 +2326,7 @@ mod tests {
         let radars = SharedRadars::new();
         let args = Cli::parse_from(["mayara-server"]);
         let info = nxt_info(&radars, &args, None);
-        FurunoReportReceiver::new(&args, radars, info)
+        FurunoReportReceiver::new(&args, radars, info, RadarModel::DRS4DNXT)
     }
 
     /// The same with Range B alongside, as a dual-range NXT runs.
@@ -2322,9 +2335,48 @@ mod tests {
         let args = Cli::parse_from(["mayara-server"]);
         let info = nxt_info(&radars, &args, Some("A"));
         let info_b = nxt_info(&radars, &args, Some("B"));
-        let mut receiver = FurunoReportReceiver::new(&args, radars.clone(), info);
+        let mut receiver =
+            FurunoReportReceiver::new(&args, radars.clone(), info, RadarModel::DRS4DNXT);
         receiver.set_range_b(&args, &radars, info_b);
         receiver
+    }
+
+    /// A DRS2D-NXT runs the DRS4D-NXT's firmware and reports its part number
+    /// in `$N96`; only the model its beacon announces tells the two apart,
+    /// even when saved settings name the other one.
+    #[tokio::test]
+    async fn a_drs2d_nxt_keeps_the_model_it_announces() {
+        for (announced, expected) in [
+            (RadarModel::DRS2DNXT, "DRS2DNXT"),
+            (RadarModel::DRS4DNXT, "DRS4DNXT"),
+        ] {
+            let radars = SharedRadars::new();
+            let args = Cli::parse_from(["mayara-server"]);
+            let info = nxt_info(&radars, &args, None);
+            let mut receiver = FurunoReportReceiver::new(&args, radars, info, announced);
+
+            receiver
+                .process_report("$N96,0359360-01.11,0359358-01.01,0359359-01.01,0359361-01.08,,,")
+                .unwrap();
+
+            assert_eq!(receiver.model, announced);
+            assert_eq!(
+                receiver.common.info.controls.model_name().as_deref(),
+                Some(expected)
+            );
+        }
+    }
+
+    /// A beacon naming a model mayara does not recognise leaves the model
+    /// saved settings name in place until `$N96` arrives.
+    #[test]
+    fn an_unknown_announced_model_keeps_the_saved_one() {
+        let radars = SharedRadars::new();
+        let args = Cli::parse_from(["mayara-server"]);
+        let info = nxt_info(&radars, &args, None);
+        let receiver = FurunoReportReceiver::new(&args, radars, info, RadarModel::Unknown);
+
+        assert_eq!(receiver.model, RadarModel::DRS4DNXT);
     }
 
     /// The alignment comes back in tenths of a degree, 0 to 3599, and one past
