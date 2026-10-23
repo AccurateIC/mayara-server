@@ -1,7 +1,8 @@
 use log::log_enabled;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, SocketAddrV4};
+use std::sync::{Arc, Mutex};
 use tokio_graceful_shutdown::{SubsystemBuilder, SubsystemHandle};
 
 use crate::locator::LocatorAddress;
@@ -12,6 +13,7 @@ use crate::{Brand, Cli};
 use super::{LocatorId, RadarLocator};
 
 mod command;
+mod heading;
 mod protocol;
 mod report;
 mod settings;
@@ -154,6 +156,8 @@ mod tests {
 struct FurunoLocator {
     args: Cli,
     half_found: HashMap<SocketAddrV4, RadarInfo>, // When the first of the two reports is found
+    /// The interfaces a heading sender runs on, shared by every clone.
+    heading_senders: Arc<Mutex<HashSet<Ipv4Addr>>>,
 }
 
 impl RadarLocator for FurunoLocator {
@@ -178,7 +182,26 @@ impl FurunoLocator {
         FurunoLocator {
             args,
             half_found: HashMap::new(),
+            heading_senders: Arc::new(Mutex::new(HashSet::new())),
         }
+    }
+
+    /// Starts relaying the heading on `nic_addr` unless that already runs.
+    /// It serves every radar on the link, so it lives as long as the
+    /// locator rather than as long as the radar that started it.
+    fn start_heading_sender(&self, nic_addr: Ipv4Addr, subsys: &SubsystemHandle) {
+        if !self.heading_senders.lock().unwrap().insert(nic_addr) {
+            return;
+        }
+        let senders = self.heading_senders.clone();
+        subsys.start(SubsystemBuilder::new(
+            format!("{}-heading", nic_addr),
+            async move |s: &mut SubsystemHandle| {
+                heading::run(s, nic_addr).await;
+                senders.lock().unwrap().remove(&nic_addr);
+                Ok::<(), anyhow::Error>(())
+            },
+        ));
     }
 
     fn found(
@@ -215,6 +238,10 @@ impl FurunoLocator {
             let report_name = info.key();
 
             info.start_forwarding_radar_messages_to_stdout(subsys);
+
+            if !self.args.is_replay() {
+                self.start_heading_sender(info.nic_addr, subsys);
+            }
 
             // The model from the original beacon string, not from controls,
             // which persistence may have overwritten.
