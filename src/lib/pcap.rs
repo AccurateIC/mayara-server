@@ -507,6 +507,31 @@ mod tests {
         ]
     }
 
+    /// Replay places a capture in time by the absolute moment its first
+    /// datagram was captured; the packets themselves count from zero.
+    #[test]
+    fn a_capture_is_anchored_at_its_first_datagram() {
+        let start = Duration::from_millis(1_700_000_000_250);
+        let mut packets = sample_packets();
+        for p in &mut packets {
+            p.timestamp += start;
+        }
+
+        let (parsed, anchor) = parse_bytes_anchored(&encode_packets(&packets)).expect("parse");
+
+        assert_eq!(anchor, start);
+        let offsets: Vec<_> = parsed.iter().map(|p| p.timestamp).collect();
+        assert_eq!(offsets, [Duration::ZERO, Duration::from_millis(100)]);
+    }
+
+    #[test]
+    fn an_empty_capture_has_no_anchor() {
+        let (parsed, anchor) = parse_bytes_anchored(&encode_packets(&[])).expect("parse");
+
+        assert!(parsed.is_empty());
+        assert_eq!(anchor, Duration::ZERO);
+    }
+
     /// The bug this guards: a fixture holding exactly these packets, but
     /// compressed by a different gzip than the one we write with, must be left
     /// alone. Comparing file bytes would rewrite it and fill the diff with
