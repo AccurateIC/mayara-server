@@ -417,6 +417,9 @@ fn tolerance(name: &str) -> f64 {
 fn compare_to_baseline(scores: &BTreeMap<String, (f64, bool)>) {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(BASELINE);
     let current: BTreeMap<&String, f64> = scores.iter().map(|(k, (v, _))| (k, *v)).collect();
+    // A NaN would pass every comparison below and be written as null.
+    let invalid: Vec<_> = current.iter().filter(|(_, v)| !v.is_finite()).collect();
+    assert!(invalid.is_empty(), "scores without a value: {invalid:?}");
     if std::env::var_os("UPDATE_ARPA_BASELINE").is_some() {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let text = serde_json::to_string_pretty(&current).unwrap();
