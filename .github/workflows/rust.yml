@@ -142,8 +142,20 @@ jobs:
     - uses: taiki-e/install-action@v2.87.28
       with:
         tool: nextest
+    # The ARPA regression test replays a 13-minute voyage, too big for this
+    # repository; it lives with the other large recordings, and this fetches
+    # only its files.
+    - name: Fetch the ARPA regression recording
+      run: |
+        git clone --depth 1 --filter=blob:none --sparse \
+          https://github.com/keesverruijt/radar-recordings.git ../radar-recordings
+        git -C ../radar-recordings sparse-checkout set --no-cone 'navico/halo/halo20plus-722*'
+      env:
+        GIT_LFS_SKIP_SMUDGE: "1"
     - name: Run tests
       run: cargo nextest run --features pcap-replay
+      env:
+        MAYARA_REQUIRE_RECORDINGS: "1"
 
   macos:
     name: Build macOS
