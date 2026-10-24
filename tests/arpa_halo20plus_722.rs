@@ -6,8 +6,9 @@
 //! the radar network and the NMEA 2000 bus at once. The radar is replayed on
 //! the capture's own clock, own ship sails the recorded voyage, and every
 //! track mayara reports on range B is scored against the AIS positions of the
-//! vessels around it. The scores must not get worse than the checked-in
-//! baseline; `UPDATE_ARPA_BASELINE=1` rewrites it after an improvement.
+//! vessels around it. The scores must match the checked-in baseline: worse
+//! fails, and so does better, until `UPDATE_ARPA_BASELINE=1` rewrites it and
+//! the improvement becomes the score to hold.
 //!
 //! The recording lives in the radar-recordings repository, next to this one
 //! or wherever `MAYARA_RADAR_RECORDINGS` points; without it the test is
@@ -414,6 +415,11 @@ fn tolerance(name: &str) -> f64 {
     }
 }
 
+/// How much better than the baseline a score may get before the test asks
+/// for a new one. The replay is deterministic, so anything more is a change
+/// in tracking rather than noise in the arithmetic.
+const IMPROVEMENT_NOISE: f64 = 1e-3;
+
 fn compare_to_baseline(scores: &BTreeMap<String, (f64, bool)>) {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(BASELINE);
     let current: BTreeMap<&String, f64> = scores.iter().map(|(k, (v, _))| (k, *v)).collect();
@@ -430,6 +436,7 @@ fn compare_to_baseline(scores: &BTreeMap<String, (f64, bool)>) {
     let baseline: BTreeMap<String, f64> =
         serde_json::from_str(&std::fs::read_to_string(&path).expect("baseline")).unwrap();
     let mut worse = Vec::new();
+    let mut better = Vec::new();
     for (name, (value, higher_is_better)) in scores {
         let Some(&base) = baseline.get(name) else {
             eprintln!("{name:32} {value:9.2}  (no baseline)");
@@ -443,7 +450,8 @@ fn compare_to_baseline(scores: &BTreeMap<String, (f64, bool)>) {
         let mark = if regression > tolerance(name) {
             worse.push(name.clone());
             "WORSE"
-        } else if regression < 0.0 {
+        } else if regression < -IMPROVEMENT_NOISE {
+            better.push(name.clone());
             "better"
         } else {
             ""
@@ -451,6 +459,11 @@ fn compare_to_baseline(scores: &BTreeMap<String, (f64, bool)>) {
         eprintln!("{name:32} {value:9.2}  baseline {base:9.2}  {mark}");
     }
     assert!(worse.is_empty(), "ARPA tracking got worse: {worse:?}");
+    assert!(
+        better.is_empty(),
+        "ARPA tracking got better: {better:?}; run with UPDATE_ARPA_BASELINE=1 \
+         and commit {BASELINE} to hold it there"
+    );
 }
 
 fn set(info: &mayara::radar::RadarInfo, id: ControlId, value: Value) {
