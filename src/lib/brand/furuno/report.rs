@@ -17,8 +17,7 @@ use super::protocol::{
     ENCODING_3_REPEAT_DEFAULT, FurunoImoFrameHeader, FurunoTileFrameHeader,
     HEADING_ADJUST_FULL_TURN, HEADING_STATE_VALID, KEEP_ALIVE, PIXEL_VALUES, RadarModel,
     SPOKE_ALIGNMENT_MASK, SPOKE_ANGLE_HIGH_MASK, SPOKE_LEN, SPOKES, TILE_MAGIC,
-    TILE_REPEAT_DEFAULT, TILE_SCALE, TX_CHANNEL_AUTO, WIRE_UNIT_KM, WIRE_UNIT_NM,
-    wire_index_to_meters_for_unit,
+    TILE_REPEAT_DEFAULT, TILE_SCALE, TX_CHANNEL_AUTO, WIRE_UNIT_KM, wire_index_to_meters_for_unit,
 };
 use super::settings;
 use crate::Cli;
@@ -2274,7 +2273,7 @@ impl FurunoReportReceiver {
         //          bits 5-7: unknown (0b110 from a DRS-NXT, 0b001 from a DRS2D)
         //
         // Bytes 12-15: Range and status
-        //   [12]   bits 0-5: range wire index; bits 6-7: range_status
+        //   [12]   bits 0-5: range wire index; bits 6-7: range unit
         //   [13]   range resolution metadata
         //   [14]   range_value low byte
         //   [15]   bits 0-2: range_value high; bit 3: flag;
@@ -2285,30 +2284,9 @@ impl FurunoReportReceiver {
         let header = decode_head::<FurunoImoFrameHeader>(data).ok()?;
         let wire_index = header.wire_index as i32;
 
-        // The radar's active range unit (NM / km) determines which wire-index
-        // table to use: the same wire index means different physical distances
-        // in nautical vs metric mode. Read RangeUnits from the controls that
-        // belong to the specific range this spoke is for — Range A and Range B
-        // can be configured with different units.
-        let range_controls = if header.radar_no == 1 {
-            self.common_b
-                .as_ref()
-                .map(|cb| &cb.info.controls)
-                .unwrap_or(&self.common.info.controls)
-        } else {
-            &self.common.info.controls
-        };
-        let wire_unit = range_controls
-            .get(&crate::radar::settings::ControlId::RangeUnits)
-            .and_then(|c| c.value)
-            .map(|v| {
-                if v as i32 == 1 {
-                    WIRE_UNIT_KM
-                } else {
-                    WIRE_UNIT_NM
-                }
-            })
-            .unwrap_or(WIRE_UNIT_NM);
+        // The same wire index means a different distance in each unit, and
+        // the frame says which unit it counts in.
+        let wire_unit = header.range_unit as i32;
         let range = wire_index_to_meters_for_unit(wire_index, wire_unit).unwrap_or_else(|| {
             log::warn!(
                 "Unknown wire index {} (unit {}) in spoke header: {:?}",
@@ -2537,6 +2515,22 @@ mod tests {
                 Some(expected)
             );
         }
+    }
+
+    /// A spoke frame's range is read in the unit the frame names, even
+    /// while the RangeUnits control has not been set, as in a replay. A
+    /// DRS2D-NXT on wire index 6 is 2 km or 2 NM.
+    #[test]
+    fn a_spoke_frame_is_ranged_in_the_unit_it_names() {
+        let receiver = nxt_receiver();
+        let mut frame = [
+            2, 186, 0, 1, 0, 0, 0, 0, 33, 8, 100, 219, 0x46, 0, 240, 0x19,
+        ];
+        let range = |frame: &[u8]| receiver.parse_metadata_header(frame).unwrap().range;
+
+        assert_eq!(range(&frame), 2000);
+        frame[12] = 0x06;
+        assert_eq!(range(&frame), 2 * 1852);
     }
 
     /// A beacon naming a model mayara does not recognise leaves the model
