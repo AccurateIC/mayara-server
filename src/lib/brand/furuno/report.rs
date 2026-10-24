@@ -17,7 +17,8 @@ use super::protocol::{
     ENCODING_3_REPEAT_DEFAULT, FurunoImoFrameHeader, FurunoTileFrameHeader,
     HEADING_ADJUST_FULL_TURN, HEADING_STATE_VALID, KEEP_ALIVE, PIXEL_VALUES, RadarModel,
     SPOKE_ALIGNMENT_MASK, SPOKE_ANGLE_HIGH_MASK, SPOKE_LEN, SPOKES, TILE_MAGIC,
-    TILE_REPEAT_DEFAULT, TILE_SCALE, TX_CHANNEL_AUTO, WIRE_UNIT_KM, wire_index_to_meters_for_unit,
+    TILE_REPEAT_DEFAULT, TILE_SCALE, TX_CHANNEL_AUTO, WIRE_UNIT_KM, WIRE_UNIT_KYD,
+    wire_index_to_meters_for_unit,
 };
 use super::settings;
 use crate::Cli;
@@ -1051,12 +1052,15 @@ impl FurunoReportReceiver {
 
                 let drid = self.extract_drid(&command_id, &numbers);
                 let range_units_value = match wire_unit {
-                    WIRE_UNIT_KM => 1.0, // Metric
-                    _ => 0.0,            // Nautical
+                    // Kiloyards share the kilometre range steps, statute
+                    // miles the nautical ones.
+                    WIRE_UNIT_KM | WIRE_UNIT_KYD => 1.0, // Metric
+                    _ => 0.0,                            // Nautical
                 };
                 let target = self.common_for_range(drid);
-                target.set_value(&ControlId::Range, range_meters as f64);
+                // The units first: they choose the steps the range snaps to.
                 target.set_value(&ControlId::RangeUnits, range_units_value);
+                target.set_value(&ControlId::Range, range_meters as f64);
             }
             CommandId::OnTime => {
                 let seconds = first_number(&numbers, "OnTime")?;
@@ -2495,7 +2499,7 @@ mod tests {
 
     /// A spoke frame's range is read in the unit the frame names, even
     /// while the RangeUnits control has not been set, as in a replay. A
-    /// DRS2D-NXT on wire index 6 is 2 km or 2 NM.
+    /// DRS2D-NXT on wire index 6 is 2 km, 2 NM, 2 SM or 2 Kyd.
     #[test]
     fn a_spoke_frame_is_ranged_in_the_unit_it_names() {
         let receiver = nxt_receiver();
@@ -2507,6 +2511,10 @@ mod tests {
         assert_eq!(range(&frame), 2000);
         frame[12] = 0x06;
         assert_eq!(range(&frame), 2 * 1852);
+        frame[12] = 0x86;
+        assert_eq!(range(&frame), 3219);
+        frame[12] = 0xc6;
+        assert_eq!(range(&frame), 1829);
     }
 
     /// A beacon naming a model mayara does not recognise leaves the model
@@ -2630,6 +2638,26 @@ mod tests {
     fn assert_alignment(common: &CommonRadar, expected: f64, when: &str) {
         let degrees = alignment(common).expect("an alignment");
         assert!((degrees - expected).abs() < 1e-6, "{when}: {degrees}");
+    }
+
+    /// A radar an MFD set to statute miles or kiloyards shows mayara's range
+    /// steps in the units nearest them: nautical for statute miles, metric
+    /// for kiloyards. 2 Kyd is 1,829 m, nearer 2 km than 1.5 km and nearer
+    /// 1 NM than either; it shows as 2 km.
+    #[tokio::test]
+    async fn a_range_in_statute_miles_or_kiloyards_shows_the_nearest_units() {
+        let mut receiver = nxt_receiver();
+        let control = |receiver: &FurunoReportReceiver, id| {
+            receiver.common.info.controls.get(&id).and_then(|c| c.value)
+        };
+
+        receiver.process_report("$N62,6,0,0").unwrap();
+        receiver.process_report("$N62,6,3,0").unwrap();
+        assert_eq!(control(&receiver, ControlId::RangeUnits), Some(1.));
+        assert_eq!(control(&receiver, ControlId::Range), Some(2000.));
+
+        receiver.process_report("$N62,6,2,0").unwrap();
+        assert_eq!(control(&receiver, ControlId::RangeUnits), Some(0.));
     }
 
     /// Channel 0 is the radar choosing for itself, which is auto rather than
