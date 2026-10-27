@@ -37,11 +37,17 @@ pub(crate) struct EmulatorReportReceiver {
 
     // Emulator state
     world: EmulatorWorld,
+    /// Where the test scenario in `world` was built around
+    world_origin: GeoPosition,
     boat_position: GeoPosition,
     boat_heading: f64,  // degrees
     boat_speed: f64,    // knots
     current_range: u32, // meters
     transmitting: bool,
+
+    /// Another navigation source places the boat, so the emulator does not
+    /// move it or publish its navigation.
+    following: bool,
 
     // Turn state for course reversal loop
     boat_turn: Option<TurnProgress>,
@@ -81,11 +87,13 @@ impl EmulatorReportReceiver {
             common,
             command_sender,
             world,
+            world_origin: initial_pos,
             boat_position: initial_pos,
             boat_heading: heading,
             boat_speed: speed,
             current_range: FRAC_NM_2 as u32, // Default 1/2 nm
             transmitting: false,
+            following: false,
             boat_turn: None,
             initial_lon: initial_pos.lon(),
             current_spoke: 0,
@@ -120,7 +128,9 @@ impl EmulatorReportReceiver {
         let batch_interval_ms = ROTATION_TIME_MS / (spokes_sent / SPOKES_PER_BATCH as u64);
         let mut spoke_interval = interval(Duration::from_millis(batch_interval_ms));
 
-        // Update navdata with initial position
+        // A source that already reports the boat places it before the
+        // emulator publishes a position of its own
+        self.follow_own_ship();
         self.update_navdata();
 
         loop {
@@ -219,6 +229,17 @@ impl EmulatorReportReceiver {
         self.last_update = now;
         let elapsed_secs = elapsed.as_secs_f64();
 
+        if !self.follow_own_ship() {
+            self.move_boat(elapsed_secs);
+        }
+
+        // Always update world (moving targets) even when boat is stationary
+        self.world.update(elapsed_secs);
+    }
+
+    /// Move the emulator's own boat along its course, turning it round at
+    /// the ends of its run.
+    fn move_boat(&mut self, elapsed_secs: f64) {
         if let Some(mut turn) = self.boat_turn.take() {
             let speed_ms = self.boat_speed * KN_TO_MS;
             let angular_velocity = speed_ms / turn.radius;
@@ -266,9 +287,34 @@ impl EmulatorReportReceiver {
 
             self.check_turn_trigger();
         }
+    }
 
-        // Always update world (moving targets) even when boat is stationary
-        self.world.update(elapsed_secs);
+    /// Take the boat's position and heading from another navigation source
+    /// while one reports them, such as the Signal K server mayara reads its
+    /// navigation from. Returns whether it does.
+    fn follow_own_ship(&mut self) -> bool {
+        let own_ship = crate::navdata::external_own_ship();
+        if own_ship.is_some() != self.following {
+            self.following = own_ship.is_some();
+            if self.following {
+                log::info!("Emulator: following own ship from the navigation source");
+                crate::navdata::withdraw_emulator_nav();
+            } else {
+                log::info!("Emulator: navigation source went quiet, moving the boat itself");
+            }
+        }
+        let Some(own_ship) = own_ship else {
+            return false;
+        };
+        (self.boat_position, self.boat_heading) = place_boat(own_ship, self.boat_heading);
+        self.boat_turn = None;
+        if out_of_sight(&self.world_origin, &self.boat_position, self.current_range) {
+            log::info!("Emulator: moving the test scenario to where the boat now is");
+            self.world = EmulatorWorld::new(self.boat_position);
+            self.world_origin = self.boat_position;
+            self.initial_lon = self.boat_position.lon();
+        }
+        true
     }
 
     /// Check whether the boat should initiate a half-circle turn to reverse course.
@@ -328,15 +374,22 @@ impl EmulatorReportReceiver {
     }
 
     fn update_navdata(&self) {
-        // Update the global navigation data
+        if self.following {
+            return;
+        }
         crate::navdata::set_position(
             Some(self.boat_position.lat()),
             Some(self.boat_position.lon()),
-            "emulator",
+            crate::navdata::EMULATOR_SOURCE,
         );
-        crate::navdata::set_heading_true(Some(self.boat_heading * DEG_TO_RAD), "emulator");
-        crate::navdata::set_sog(Some(self.boat_speed * KN_TO_MS));
-        crate::navdata::set_cog(Some(self.boat_heading * DEG_TO_RAD));
+        crate::navdata::set_heading_true(
+            Some(self.boat_heading * DEG_TO_RAD),
+            crate::navdata::EMULATOR_SOURCE,
+        );
+        crate::navdata::set_emulator_course(
+            self.boat_heading * DEG_TO_RAD,
+            self.boat_speed * KN_TO_MS,
+        );
     }
 
     fn generate_spoke_batch(&mut self) {
@@ -370,7 +423,9 @@ impl EmulatorReportReceiver {
             if new_spoke < self.current_spoke {
                 // Rotation wrapped - broadcast heading to ensure GUI receives it
                 self.rotation_count += 1;
-                crate::navdata::broadcast_heading("emulator");
+                if !self.following {
+                    crate::navdata::broadcast_heading(crate::navdata::EMULATOR_SOURCE);
+                }
             }
             self.current_spoke = new_spoke;
         }
@@ -388,8 +443,7 @@ impl EmulatorReportReceiver {
         let sin_b = world_bearing_rad.sin();
         let cos_b = world_bearing_rad.cos();
 
-        // Spokes are 1.5x the range setting
-        let spoke_range = self.current_range as f64 * 1.5;
+        let spoke_range = self.current_range as f64 * SPOKE_RANGE_FACTOR;
         let meters_per_pixel = spoke_range / EMULATOR_SPOKE_LEN as f64;
 
         // Generate spoke data directly as bytes (one byte per pixel, 4-bit intensity)
@@ -402,6 +456,28 @@ impl EmulatorReportReceiver {
 
         data
     }
+}
+
+/// How far past the range setting the spokes reach, like a HALO's
+const SPOKE_RANGE_FACTOR: f64 = 1.5;
+
+/// Whether the radar at `boat`, set to `range`, can no longer see anything of
+/// a test scenario built around `origin`.
+fn out_of_sight(origin: &GeoPosition, boat: &GeoPosition, range: u32) -> bool {
+    const METERS_PER_DEGREE: f64 = 111_320.0;
+    let reach = range as f64 * SPOKE_RANGE_FACTOR;
+    let north = (boat.lat() - origin.lat()) * METERS_PER_DEGREE;
+    let east = (boat.lon() - origin.lon()) * METERS_PER_DEGREE * origin.lat().to_radians().cos();
+    north.hypot(east) > reach
+}
+
+/// Where a followed source puts the boat: its position, and its heading in
+/// degrees, or `heading` when the source gives neither heading nor course.
+fn place_boat(
+    (position, source_heading): (GeoPosition, Option<f64>),
+    heading: f64,
+) -> (GeoPosition, f64) {
+    (position, source_heading.map_or(heading, f64::to_degrees))
 }
 
 fn next_spoke(spoke: u16, step: u16) -> u16 {
@@ -472,6 +548,40 @@ mod tests {
         assert_eq!(sent.len(), EMULATOR_SPOKES / 4);
         assert!(sent.iter().all(|spoke| spoke % 4 == 0));
         assert_eq!(one_rotation(1).len(), EMULATOR_SPOKES);
+    }
+
+    /// The boat goes where the followed source puts it and points where
+    /// that source heads (or, without a heading, where its course goes).
+    #[test]
+    fn a_followed_source_places_and_points_the_boat() {
+        let fix = GeoPosition::new(53.19, 5.33);
+
+        let (position, heading) = place_boat((fix, Some(PI / 2.0)), 270.0);
+        assert_eq!(position, fix);
+        assert!((heading - 90.0).abs() < 1e-9);
+
+        let (_, heading) = place_boat((fix, None), 270.0);
+        assert_eq!(
+            heading, 270.0,
+            "keeps its heading without one from the source"
+        );
+    }
+
+    /// A fix within what the radar shows at its range keeps the test scenario
+    /// where it is; one beyond it moves the scenario to the boat, even when
+    /// a longer range would still reach it.
+    #[test]
+    fn a_fix_beyond_the_displayed_range_is_out_of_sight() {
+        let origin = GeoPosition::new(53.0, 5.6);
+        let range = FRAC_NM_2 as u32;
+        let reach = range as f64 * SPOKE_RANGE_FACTOR;
+
+        let near = origin.position_from_bearing(PI / 4.0, reach * 0.9);
+        assert!(!out_of_sight(&origin, &near, range));
+        let far = origin.position_from_bearing(PI / 4.0, reach * 1.1);
+        assert!(out_of_sight(&origin, &far, range));
+        let longest = *super::super::EMULATOR_RANGES.last().unwrap() as u32;
+        assert!(!out_of_sight(&origin, &far, longest));
     }
 
     fn echo(closing_speed: f64) -> Echo {
