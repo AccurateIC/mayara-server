@@ -33,6 +33,14 @@ const CM_PER_M: f64 = 100.0;
 // Conversion constants
 const DEG_TO_RAD: f64 = PI / 180.0;
 
+/// Half the antenna's horizontal beam width, in radians. An echo spreads
+/// over that much of the picture to either side, as on a real radar, so a
+/// small boat far out shows as an arc rather than a speck or not at all.
+const HALF_BEAM_WIDTH: f64 = 1.0 * DEG_TO_RAD;
+/// An echo is never shorter than this many pixels along a spoke, as a
+/// radar pulse has a length of its own.
+const MIN_ECHO_PIXELS: f64 = 2.0;
+
 pub(crate) struct EmulatorReportReceiver {
     common: CommonRadar,
     command_sender: Option<Command>,
@@ -298,6 +306,7 @@ impl EmulatorReportReceiver {
         let own_ship = crate::navdata::external_own_ship();
         if own_ship.is_some() != self.following {
             self.following = own_ship.is_some();
+            self.world.show_test_scenario(!self.following);
             if self.following {
                 log::info!("Emulator: following own ship from the navigation source");
                 crate::navdata::withdraw_emulator_nav();
@@ -313,6 +322,7 @@ impl EmulatorReportReceiver {
         if out_of_sight(&self.world_origin, &self.boat_position, self.current_range) {
             log::info!("Emulator: moving the test scenario to where the boat now is");
             self.world = EmulatorWorld::new(self.boat_position);
+            self.world.show_test_scenario(false);
             self.world_origin = self.boat_position;
             self.initial_lon = self.boat_position.lon();
         }
@@ -398,7 +408,10 @@ impl EmulatorReportReceiver {
         self.common.new_spoke_message();
 
         // Update the world's local coordinate cache once per batch
-        self.world.update_cache(&self.boat_position);
+        self.world.update_cache(
+            &self.boat_position,
+            meters_per_pixel(self.current_range) * MIN_ECHO_PIXELS,
+        );
         let legend = self.common.info.get_legend();
         let doppler = DopplerColors::new(
             legend.doppler_approaching,
@@ -425,6 +438,7 @@ impl EmulatorReportReceiver {
             if new_spoke < self.current_spoke {
                 // Rotation wrapped - broadcast heading to ensure GUI receives it
                 self.rotation_count += 1;
+                self.refresh_ais();
                 if !self.following {
                     crate::navdata::broadcast_heading(crate::navdata::EMULATOR_SOURCE);
                 }
@@ -446,16 +460,25 @@ impl EmulatorReportReceiver {
         let cos_b = world_bearing_rad.cos();
 
         let meters_per_pixel = meters_per_pixel(self.current_range);
+        let boats = self.world.boats_on_spoke(sin_b, cos_b, HALF_BEAM_WIDTH);
 
         // Generate spoke data directly as bytes (one byte per pixel, 4-bit intensity)
         let mut data: Vec<u8> = Vec::with_capacity(EMULATOR_SPOKE_LEN);
 
         for pixel in 0..EMULATOR_SPOKE_LEN {
             let distance = pixel as f64 * meters_per_pixel;
-            data.push(doppler.pixel(self.world.echo_fast(sin_b, cos_b, distance)));
+            data.push(doppler.pixel(self.world.echo_fast(sin_b, cos_b, distance, &boats)));
         }
 
         data
+    }
+
+    /// Take the AIS vessels the navigation source reported since the last
+    /// rotation, so they echo where they now are.
+    fn refresh_ais(&mut self) {
+        if let Some(store) = crate::navdata::get_ais_store() {
+            self.world.set_ais_vessels(&store.get_all_active());
+        }
     }
 }
 
