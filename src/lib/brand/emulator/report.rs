@@ -413,7 +413,7 @@ impl EmulatorReportReceiver {
             let heading_spoke = ((self.boat_heading / 360.0) * EMULATOR_SPOKES as f64) as u16;
 
             self.common.add_spoke(
-                self.current_range,
+                spoke_range(self.current_range),
                 self.current_spoke,
                 Some(heading_spoke),
                 spoke_data,
@@ -443,8 +443,7 @@ impl EmulatorReportReceiver {
         let sin_b = world_bearing_rad.sin();
         let cos_b = world_bearing_rad.cos();
 
-        let spoke_range = self.current_range as f64 * SPOKE_RANGE_FACTOR;
-        let meters_per_pixel = spoke_range / EMULATOR_SPOKE_LEN as f64;
+        let meters_per_pixel = spoke_range(self.current_range) as f64 / EMULATOR_SPOKE_LEN as f64;
 
         // Generate spoke data directly as bytes (one byte per pixel, 4-bit intensity)
         let mut data: Vec<u8> = Vec::with_capacity(EMULATOR_SPOKE_LEN);
@@ -458,14 +457,11 @@ impl EmulatorReportReceiver {
     }
 }
 
-/// How far past the range setting the spokes reach, like a HALO's
-const SPOKE_RANGE_FACTOR: f64 = 1.5;
-
 /// Whether the radar at `boat`, set to `range`, can no longer see anything of
 /// a test scenario built around `origin`.
 fn out_of_sight(origin: &GeoPosition, boat: &GeoPosition, range: u32) -> bool {
     const METERS_PER_DEGREE: f64 = 111_320.0;
-    let reach = range as f64 * SPOKE_RANGE_FACTOR;
+    let reach = spoke_range(range) as f64;
     let north = (boat.lat() - origin.lat()) * METERS_PER_DEGREE;
     let east = (boat.lon() - origin.lon()) * METERS_PER_DEGREE * origin.lat().to_radians().cos();
     north.hypot(east) > reach
@@ -478,6 +474,13 @@ fn place_boat(
     heading: f64,
 ) -> (GeoPosition, f64) {
     (position, source_heading.map_or(heading, f64::to_degrees))
+}
+
+/// The distance a spoke covers, in meters. Like a HALO, the emulator paints
+/// past the range setting, and it reports the distance its spokes actually
+/// reach so that every echo is drawn where it is.
+fn spoke_range(range: u32) -> u32 {
+    range * 3 / 2
 }
 
 fn next_spoke(spoke: u16, step: u16) -> u16 {
@@ -574,7 +577,7 @@ mod tests {
     fn a_fix_beyond_the_displayed_range_is_out_of_sight() {
         let origin = GeoPosition::new(53.0, 5.6);
         let range = FRAC_NM_2 as u32;
-        let reach = range as f64 * SPOKE_RANGE_FACTOR;
+        let reach = spoke_range(range) as f64;
 
         let near = origin.position_from_bearing(PI / 4.0, reach * 0.9);
         assert!(!out_of_sight(&origin, &near, range));
