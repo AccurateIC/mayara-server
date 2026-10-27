@@ -63,10 +63,17 @@ impl Coast {
         // many thousand points stays cheap.
         let mut edges: Vec<((f64, f64), (f64, f64))> = Vec::new();
         let mut by_spoke: Vec<Vec<usize>> = vec![Vec::new(); spokes];
+        // A boat on land, in a harbour the chart draws as land say, starts
+        // every beam on land: one ray crossing an odd number of edges, out
+        // to any distance, tells.
+        let mut crossed_northwards = 0;
         for ring in &self.rings {
             let local: Vec<(f64, f64)> = ring.iter().map(to_local).collect();
             for pair in local.windows(2) {
                 let (p, q) = (pair[0], pair[1]);
+                if ray_crossing(0.0, 1.0, p, q).is_some() {
+                    crossed_northwards += 1;
+                }
                 if distance_to_segment(p, q) > max_range {
                     continue;
                 }
@@ -77,6 +84,8 @@ impl Coast {
                 }
             }
         }
+
+        let on_land = crossed_northwards % 2 == 1;
 
         by_spoke
             .iter()
@@ -90,6 +99,9 @@ impl Coast {
                     .filter(|&t| t < max_range)
                     .collect();
                 crossings.sort_by(f64::total_cmp);
+                if on_land {
+                    crossings.insert(0, 0.0);
+                }
                 crossings
                     .chunks(2)
                     .map(|pair| (pair[0], pair.get(1).copied().unwrap_or(max_range)))
@@ -223,6 +235,20 @@ mod tests {
 
     fn land(value: &Value, max_range: f64) -> Vec<Vec<(f64, f64)>> {
         Coast::from_geojson(value).spokes(&GeoPosition::new(53.2, 5.3), SPOKES, max_range)
+    }
+
+    /// From a boat inside the land every beam starts on land and leaves it
+    /// at the shore, instead of the water and land swapping places.
+    #[test]
+    fn a_boat_on_land_sees_land_from_where_it_is() {
+        let spokes = land(&square_north(-500.0, 500.0, 500.0), 3000.0);
+
+        for spoke in [0, SPOKES / 4, SPOKES / 2, 3 * SPOKES / 4] {
+            let beam = &spokes[spoke];
+            assert_eq!(beam.len(), 1, "{beam:?}");
+            assert_eq!(beam[0].0, 0.0, "{beam:?}");
+            assert!((beam[0].1 - 500.0).abs() < 1.0, "{beam:?}");
+        }
     }
 
     /// The beam heading for the land enters it at its near edge and leaves

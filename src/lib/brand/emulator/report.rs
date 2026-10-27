@@ -160,6 +160,7 @@ impl EmulatorReportReceiver {
         // A source that already reports the boat places it before the
         // emulator publishes a position of its own
         self.follow_own_ship();
+        self.refresh_coast();
         self.update_navdata();
 
         loop {
@@ -172,10 +173,12 @@ impl EmulatorReportReceiver {
                 _ = spoke_interval.tick() => {
                     // The emulator is its own radar, so it is never silent.
                     self.common.info.mark_input();
-                    if self.transmitting {
-                        self.generate_spoke_batch();
-                    }
+                    let rotation_ended = self.transmitting && self.generate_spoke_batch();
                     self.update_boat_position();
+                    // From where the boat is now, as the next rotation sees it
+                    if rotation_ended {
+                        self.refresh_coast();
+                    }
                     self.update_navdata();
                 }
 
@@ -423,7 +426,8 @@ impl EmulatorReportReceiver {
         );
     }
 
-    fn generate_spoke_batch(&mut self) {
+    /// Returns whether the batch finished a rotation.
+    fn generate_spoke_batch(&mut self) -> bool {
         self.common.new_spoke_message();
 
         // Update the world's local coordinate cache once per batch
@@ -439,6 +443,7 @@ impl EmulatorReportReceiver {
             self.doppler_threshold,
         );
 
+        let mut rotation_ended = false;
         for _ in 0..SPOKES_PER_BATCH {
             let spoke_data = self.generate_spoke(self.current_spoke, &doppler);
 
@@ -457,8 +462,8 @@ impl EmulatorReportReceiver {
             if new_spoke < self.current_spoke {
                 // Rotation wrapped - broadcast heading to ensure GUI receives it
                 self.rotation_count += 1;
+                rotation_ended = true;
                 self.refresh_ais();
-                self.refresh_coast();
                 if !self.following {
                     crate::navdata::broadcast_heading(crate::navdata::EMULATOR_SOURCE);
                 }
@@ -467,6 +472,7 @@ impl EmulatorReportReceiver {
         }
 
         self.common.send_spoke_message();
+        rotation_ended
     }
 
     fn generate_spoke(&self, spoke_angle: u16, doppler: &DopplerColors) -> GenericSpoke {
