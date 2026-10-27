@@ -7,7 +7,9 @@ use tokio_graceful_shutdown::SubsystemHandle;
 
 use super::command::Command;
 use super::world::{Echo, EmulatorWorld, TURN_RADIUS, TurnProgress};
-use super::{EMULATOR_SPOKE_LEN, EMULATOR_SPOKES, get_initial_position, spoke_step};
+use super::{
+    EMULATOR_RANGES, EMULATOR_SPOKE_LEN, EMULATOR_SPOKES, get_initial_position, spoke_step,
+};
 use crate::Cli;
 use crate::radar::settings::{ControlId, ControlUpdate};
 use crate::radar::spoke::GenericSpoke;
@@ -192,7 +194,7 @@ impl EmulatorReportReceiver {
                 if let Some(ref value) = cv.value
                     && let Some(range_val) = value.as_f64()
                 {
-                    let range = range_val as u32;
+                    let range = clamp_range(range_val);
                     log::debug!("{}: Range changed to {} m", self.common.key, range);
                     self.current_range = range;
                     self.common.set_value(&ControlId::Range, range as f64);
@@ -443,7 +445,7 @@ impl EmulatorReportReceiver {
         let sin_b = world_bearing_rad.sin();
         let cos_b = world_bearing_rad.cos();
 
-        let meters_per_pixel = spoke_range(self.current_range) as f64 / EMULATOR_SPOKE_LEN as f64;
+        let meters_per_pixel = meters_per_pixel(self.current_range);
 
         // Generate spoke data directly as bytes (one byte per pixel, 4-bit intensity)
         let mut data: Vec<u8> = Vec::with_capacity(EMULATOR_SPOKE_LEN);
@@ -480,7 +482,20 @@ fn place_boat(
 /// past the range setting, and it reports the distance its spokes actually
 /// reach so that every echo is drawn where it is.
 fn spoke_range(range: u32) -> u32 {
-    range * 3 / 2
+    u32::try_from(u64::from(range) * 3 / 2).unwrap_or(u32::MAX)
+}
+
+/// The distance one pixel of a spoke covers at this range setting, in meters.
+fn meters_per_pixel(range: u32) -> f64 {
+    spoke_range(range) as f64 / EMULATOR_SPOKE_LEN as f64
+}
+
+/// A requested range in meters, held to the ranges the emulator offers. A
+/// request with explicit units reaches the emulator unsnapped.
+fn clamp_range(meters: f64) -> u32 {
+    let shortest = *EMULATOR_RANGES.first().unwrap_or(&0) as f64;
+    let longest = *EMULATOR_RANGES.last().unwrap_or(&0) as f64;
+    meters.clamp(shortest, longest).round() as u32
 }
 
 fn next_spoke(spoke: u16, step: u16) -> u16 {
@@ -533,6 +548,33 @@ impl DopplerColors {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Spokes reach half as far again as the range, rounded down to whole
+    /// meters, and the pixels span exactly that reach.
+    #[test]
+    fn spoke_range_is_half_as_far_again_as_the_range() {
+        assert_eq!(spoke_range(0), 0);
+        assert_eq!(spoke_range(75), 112);
+        let longest = *EMULATOR_RANGES.last().unwrap() as u32;
+        assert_eq!(spoke_range(longest), longest * 3 / 2);
+        assert_eq!(spoke_range(u32::MAX), u32::MAX);
+
+        for range in [75, longest] {
+            let reach = meters_per_pixel(range) * EMULATOR_SPOKE_LEN as f64;
+            assert!((reach - spoke_range(range) as f64).abs() < 1e-6, "{range}");
+        }
+    }
+
+    /// A range outside the emulator's own is held to the nearest one it has.
+    #[test]
+    fn a_range_request_is_held_to_the_emulators_ranges() {
+        let shortest = *EMULATOR_RANGES.first().unwrap() as u32;
+        let longest = *EMULATOR_RANGES.last().unwrap() as u32;
+        assert_eq!(clamp_range(0.0), shortest);
+        assert_eq!(clamp_range(1e12), longest);
+        assert_eq!(clamp_range(f64::INFINITY), longest);
+        assert_eq!(clamp_range(1500.4), 1500);
+    }
     use std::collections::BTreeSet;
 
     fn one_rotation(step: u16) -> BTreeSet<u16> {
