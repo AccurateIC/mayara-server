@@ -1,5 +1,7 @@
+use std::collections::HashMap;
 use std::f64::consts::{PI, TAU};
 
+use crate::ais::AisVesselApi;
 use crate::radar::{GeoPosition, KN_TO_MS};
 
 // Constants for east-moving targets simulation
@@ -30,6 +32,15 @@ const FAST_TARGET_SPEED_KNOTS: f64 = 40.0;
 const FAST_TARGET_DISTANCE_NORTH: f64 = 300.0; // meters
 const FAST_TARGET_SPACING: f64 = 400.0; // meters between targets
 const NUM_FAST_TARGETS: usize = 10;
+
+/// Echo radius of the test scenario's boats, in meters
+const TARGET_RADIUS: f64 = 30.0;
+
+/// Echo radius of an AIS vessel whose length is unknown, in meters
+const AIS_DEFAULT_RADIUS: f64 = 15.0;
+/// AIS vessels echo with half their length, kept within these bounds
+const AIS_MIN_RADIUS: f64 = 5.0;
+const AIS_MAX_RADIUS: f64 = 200.0;
 
 // Conversion constants
 const DEG_TO_RAD: f64 = PI / 180.0;
@@ -134,6 +145,47 @@ impl Target {
             turned: 0.0,
             clockwise: false,
         });
+    }
+}
+
+/// A vessel the navigation source reports over AIS, echoing like a boat of
+/// its size
+#[derive(Clone, Debug)]
+pub(crate) struct AisEcho {
+    target: Target,
+    /// Radar return radius in meters
+    radius: f64,
+    mmsi: String,
+    /// Latitude, longitude, course (radians) and speed of the report
+    /// `target` set out from
+    report: [f64; 4],
+}
+
+impl AisEcho {
+    /// `None` for a vessel without a position. One without course or speed
+    /// is taken to be lying still.
+    fn new(vessel: &AisVesselApi) -> Option<Self> {
+        let position = vessel.position.as_ref()?;
+        let course = vessel.cog.or(vessel.heading).unwrap_or(0.0);
+        let speed = vessel.sog.unwrap_or(0.0);
+        let radius = vessel
+            .dimensions
+            .as_ref()
+            .and_then(|d| d.length)
+            .map_or(AIS_DEFAULT_RADIUS, |length| {
+                (length / 2.0).clamp(AIS_MIN_RADIUS, AIS_MAX_RADIUS)
+            });
+        Some(AisEcho {
+            target: Target {
+                position: GeoPosition::new(position.latitude, position.longitude),
+                heading: course.to_degrees(),
+                speed,
+                turn: None,
+            },
+            radius,
+            mmsi: vessel.mmsi.clone(),
+            report: [position.latitude, position.longitude, course, speed],
+        })
     }
 }
 
@@ -260,14 +312,14 @@ impl LandArea {
     }
 }
 
-/// Cached local coordinates for efficient per-spoke lookups
 /// A boat in local coords (x east, y north, in meters) with its velocity
-/// over ground in m/s.
+/// over ground in m/s and its echo radius in meters.
 struct LocalBoat {
     x: f64,
     y: f64,
     vx: f64,
     vy: f64,
+    radius: f64,
 }
 
 impl LocalBoat {
@@ -280,6 +332,17 @@ impl LocalBoat {
         }
         -(self.vx * self.x + self.vy * self.y) / distance
     }
+}
+
+/// A boat a spoke passes through, in that spoke's terms
+pub(crate) struct SpokeBoat {
+    /// Distance along the spoke to the boat's centre, in meters
+    along: f64,
+    /// How far the boat's centre lies off the spoke, in meters, less the
+    /// beam's spread at that distance
+    across: f64,
+    radius: f64,
+    closing_speed: f64,
 }
 
 /// What the radar sees at one point.
@@ -306,9 +369,10 @@ impl Echo {
     }
 }
 
+/// Cached local coordinates for efficient per-spoke lookups
 pub(crate) struct LocalCache {
-    /// Land center in local coords
-    land_center: (f64, f64),
+    /// Land center in local coords, while the test scenario shows
+    land_center: Option<(f64, f64)>,
     /// Every moving boat, in local coords
     boats: Vec<LocalBoat>,
     /// Buoy positions in local coords (with radius squared)
@@ -329,6 +393,11 @@ pub(crate) struct EmulatorWorld {
     pub circling_target: CirclingTarget,
     /// Static buoys
     pub buoys: Vec<Buoy>,
+    /// Whether the boats, land and buoys above show. They are placed around
+    /// the emulator's own boat, so they only fit while it sails that boat.
+    test_scenario: bool,
+    /// Vessels the navigation source reports over AIS
+    ais: Vec<AisEcho>,
     /// Cached local coordinates (updated once per batch)
     cache: Option<LocalCache>,
 }
@@ -430,6 +499,8 @@ impl EmulatorWorld {
             fast_targets,
             circling_target,
             buoys,
+            test_scenario: true,
+            ais: Vec::new(),
             cache: None,
         }
     }
@@ -446,8 +517,47 @@ impl EmulatorWorld {
             target.update(elapsed_secs);
         }
         self.circling_target.update(elapsed_secs);
+        for echo in &mut self.ais {
+            echo.target.update(elapsed_secs);
+        }
         // Invalidate cache when positions change
         self.cache = None;
+    }
+
+    pub(crate) fn show_test_scenario(&mut self, show: bool) {
+        self.test_scenario = show;
+    }
+
+    /// Lay the test scenario out afresh around `origin`. The AIS vessels and
+    /// whether the scenario shows stay as they are.
+    pub(crate) fn rebuild_around(&mut self, origin: GeoPosition) {
+        let rebuilt = EmulatorWorld::new(origin);
+        *self = EmulatorWorld {
+            test_scenario: self.test_scenario,
+            ais: std::mem::take(&mut self.ais),
+            ..rebuilt
+        };
+    }
+
+    /// Replace the AIS vessels with the latest the navigation source
+    /// reported. Between reports they move on along their course, so a
+    /// vessel whose report has not changed keeps where it has got to.
+    pub(crate) fn set_ais_vessels(&mut self, vessels: &[AisVesselApi]) {
+        let mut previous: HashMap<String, AisEcho> = std::mem::take(&mut self.ais)
+            .into_iter()
+            .map(|echo| (echo.mmsi.clone(), echo))
+            .collect();
+        self.ais = vessels
+            .iter()
+            .filter_map(AisEcho::new)
+            .map(|fresh| match previous.remove(&fresh.mmsi) {
+                Some(moved_on) if moved_on.report == fresh.report => AisEcho {
+                    radius: fresh.radius,
+                    ..moved_on
+                },
+                _ => fresh,
+            })
+            .collect();
     }
 
     /// Initiate port (counterclockwise) half-circle turns for all linear targets
@@ -500,8 +610,10 @@ impl EmulatorWorld {
     }
 
     /// Update the local coordinate cache for the current boat position
-    /// Call once per spoke batch before generating spokes
-    pub(crate) fn update_cache(&mut self, boat_pos: &GeoPosition) {
+    /// Call once per spoke batch before generating spokes. No echo is
+    /// smaller than `min_radius`, so a small boat still shows when a pixel
+    /// spans more than its size.
+    pub(crate) fn update_cache(&mut self, boat_pos: &GeoPosition, min_radius: f64) {
         const METERS_PER_DEGREE_LAT: f64 = 111_320.0;
 
         let lat_rad = boat_pos.lat().to_radians();
@@ -516,7 +628,7 @@ impl EmulatorWorld {
             )
         };
 
-        let boat = |position: &GeoPosition, heading: f64, speed: f64| {
+        let boat = |position: &GeoPosition, heading: f64, speed: f64, radius: f64| {
             let (x, y) = to_local(position);
             let heading = heading * DEG_TO_RAD;
             LocalBoat {
@@ -524,41 +636,89 @@ impl EmulatorWorld {
                 y,
                 vx: speed * heading.sin(),
                 vy: speed * heading.cos(),
+                radius: radius.max(min_radius),
             }
         };
-        let circling = &self.circling_target;
-        let boats = self
-            .targets
-            .iter()
-            .chain(&self.crossing_targets)
-            .chain(&self.fast_targets)
-            .map(|t| boat(&t.position, t.heading, t.speed))
-            .chain(std::iter::once(boat(
-                &circling.position,
-                circling.heading,
-                circling.angular_velocity * circling.radius,
-            )))
-            .collect();
-
-        self.cache = Some(LocalCache {
-            land_center: to_local(&self.land.center),
-            boats,
-            buoys: self
-                .buoys
-                .iter()
-                .map(|b| {
-                    let (x, y) = to_local(&b.position);
-                    (x, y, b.radius * b.radius)
-                })
-                .collect(),
+        let ais = self.ais.iter().map(|echo| {
+            let t = &echo.target;
+            boat(&t.position, t.heading, t.speed, echo.radius)
         });
+
+        self.cache = Some(if self.test_scenario {
+            let circling = &self.circling_target;
+            LocalCache {
+                land_center: Some(to_local(&self.land.center)),
+                boats: self
+                    .targets
+                    .iter()
+                    .chain(&self.crossing_targets)
+                    .chain(&self.fast_targets)
+                    .map(|t| boat(&t.position, t.heading, t.speed, TARGET_RADIUS))
+                    .chain(std::iter::once(boat(
+                        &circling.position,
+                        circling.heading,
+                        circling.angular_velocity * circling.radius,
+                        TARGET_RADIUS,
+                    )))
+                    .chain(ais)
+                    .collect(),
+                buoys: self
+                    .buoys
+                    .iter()
+                    .map(|b| {
+                        let (x, y) = to_local(&b.position);
+                        (x, y, b.radius * b.radius)
+                    })
+                    .collect(),
+            }
+        } else {
+            LocalCache {
+                land_center: None,
+                boats: ais.collect(),
+                buoys: Vec::new(),
+            }
+        });
+    }
+
+    /// The boats a spoke at this bearing passes through. With hundreds of
+    /// AIS vessels about, checking each one for every pixel of every spoke
+    /// would cost far more than a rotation lasts.
+    ///
+    /// `half_beam` is half the beam width, in radians: a boat that far off
+    /// the spoke still shows on it in full.
+    pub(crate) fn boats_on_spoke(&self, sin_b: f64, cos_b: f64, half_beam: f64) -> Vec<SpokeBoat> {
+        let Some(cache) = &self.cache else {
+            return Vec::new();
+        };
+        cache
+            .boats
+            .iter()
+            .filter_map(|boat| {
+                let along = boat.x * sin_b + boat.y * cos_b;
+                let across = boat.x * cos_b - boat.y * sin_b;
+                let across = (across.abs() - along.max(0.0) * half_beam).max(0.0);
+                (along > -boat.radius && across < boat.radius).then(|| SpokeBoat {
+                    along,
+                    across,
+                    radius: boat.radius,
+                    closing_speed: boat.closing_speed(),
+                })
+            })
+            .collect()
     }
 
     /// Get the radar return at a given position
     /// Uses cached local coordinates for efficiency
-    /// sin_b, cos_b are precomputed sin/cos of bearing
+    /// sin_b, cos_b are precomputed sin/cos of bearing; `boats` are the
+    /// boats on that spoke, from [`Self::boats_on_spoke`]
     #[inline]
-    pub(crate) fn echo_fast(&self, sin_b: f64, cos_b: f64, distance: f64) -> Echo {
+    pub(crate) fn echo_fast(
+        &self,
+        sin_b: f64,
+        cos_b: f64,
+        distance: f64,
+        boats: &[SpokeBoat],
+    ) -> Echo {
         let cache = match &self.cache {
             Some(c) => c,
             None => return Echo::NONE,
@@ -569,9 +729,9 @@ impl EmulatorWorld {
         let point_y = distance * cos_b;
 
         // Check land using cached local coords
-        {
-            let dx = point_x - cache.land_center.0;
-            let dy = point_y - cache.land_center.1;
+        if let Some(land_center) = cache.land_center {
+            let dx = point_x - land_center.0;
+            let dy = point_y - land_center.1;
             let cos_o = self.land.orientation_rad.cos();
             let sin_o = self.land.orientation_rad.sin();
             let local_x = dx * cos_o - dy * sin_o;
@@ -582,18 +742,13 @@ impl EmulatorWorld {
         }
 
         // Check targets - they appear as point targets with some spread
-        const TARGET_RADIUS: f64 = 30.0;
-        const TARGET_RADIUS_SQ: f64 = TARGET_RADIUS * TARGET_RADIUS;
-
-        for boat in &cache.boats {
-            let dx = point_x - boat.x;
-            let dy = point_y - boat.y;
-            let dist_sq = dx * dx + dy * dy;
-            if dist_sq < TARGET_RADIUS_SQ {
-                let intensity = 15.0 - (dist_sq.sqrt() / TARGET_RADIUS) * 5.0;
+        for boat in boats {
+            let off = (distance - boat.along).hypot(boat.across);
+            if off < boat.radius {
+                let intensity = 15.0 - (off / boat.radius) * 5.0;
                 return Echo {
                     intensity: intensity.max(13.0) as u8,
-                    closing_speed: boat.closing_speed(),
+                    closing_speed: boat.closing_speed,
                 };
             }
         }
@@ -618,8 +773,9 @@ impl EmulatorWorld {
         bearing_rad: f64,
         distance: f64,
     ) -> u8 {
-        self.echo_fast(bearing_rad.sin(), bearing_rad.cos(), distance)
-            .intensity
+        let (sin_b, cos_b) = bearing_rad.sin_cos();
+        let boats = self.boats_on_spoke(sin_b, cos_b, 0.0);
+        self.echo_fast(sin_b, cos_b, distance, &boats).intensity
     }
 }
 
@@ -699,23 +855,196 @@ mod tests {
             y: 500.0,
             vx: 0.0,
             vy: -speed,
+            radius: TARGET_RADIUS,
         };
         let north_heading_north = LocalBoat {
             x: 0.0,
             y: 500.0,
             vx: 0.0,
             vy: speed,
+            radius: TARGET_RADIUS,
         };
         let north_heading_east = LocalBoat {
             x: 0.0,
             y: 500.0,
             vx: speed,
             vy: 0.0,
+            radius: TARGET_RADIUS,
         };
 
         assert!((north_heading_south.closing_speed() - speed).abs() < 1e-9);
         assert!((north_heading_north.closing_speed() + speed).abs() < 1e-9);
         assert!(north_heading_east.closing_speed().abs() < 1e-9);
+    }
+
+    const OWN_SHIP: (f64, f64) = (53.2, 5.3);
+    /// Half a 2° beam
+    const HALF_BEAM: f64 = DEG_TO_RAD;
+
+    fn vessel(bearing_deg: f64, distance: f64, length: Option<f64>) -> AisVesselApi {
+        let own = GeoPosition::new(OWN_SHIP.0, OWN_SHIP.1);
+        let at = own.position_from_bearing(bearing_deg * DEG_TO_RAD, distance);
+        AisVesselApi {
+            mmsi: "244000001".into(),
+            name: None,
+            position: Some(crate::ais::Position {
+                latitude: at.lat(),
+                longitude: at.lon(),
+            }),
+            dimensions: length.map(|length| crate::ais::Dimensions {
+                length: Some(length),
+                ..Default::default()
+            }),
+            heading: None,
+            cog: Some(0.0),
+            sog: Some(5.0),
+        }
+    }
+
+    /// A world showing only the given AIS vessels around own ship
+    fn ais_world(vessels: &[AisVesselApi]) -> EmulatorWorld {
+        let own = GeoPosition::new(OWN_SHIP.0, OWN_SHIP.1);
+        let mut world = EmulatorWorld::new(own);
+        world.show_test_scenario(false);
+        world.set_ais_vessels(vessels);
+        world.update_cache(&own, 1.0);
+        world
+    }
+
+    fn echo_at(world: &EmulatorWorld, bearing_deg: f64, distance: f64) -> Echo {
+        let (sin_b, cos_b) = (bearing_deg * DEG_TO_RAD).sin_cos();
+        let boats = world.boats_on_spoke(sin_b, cos_b, HALF_BEAM);
+        world.echo_fast(sin_b, cos_b, distance, &boats)
+    }
+
+    /// An AIS vessel echoes where it is, as long as half its length, and
+    /// carries its speed towards own ship for Doppler.
+    #[test]
+    fn an_ais_vessel_echoes_at_its_position_with_its_size() {
+        let world = ais_world(&[vessel(180.0, 1000.0, Some(100.0))]);
+
+        let centre = echo_at(&world, 180.0, 1000.0);
+        assert!(centre.intensity >= 14, "strongest at the centre");
+        assert!(
+            (centre.closing_speed - 5.0).abs() < 0.1,
+            "heads north at 5 m/s"
+        );
+        assert_eq!(echo_at(&world, 180.0, 1040.0).intensity, 13);
+        assert_eq!(echo_at(&world, 180.0, 1060.0), Echo::NONE);
+        assert_eq!(echo_at(&world, 90.0, 1000.0), Echo::NONE);
+    }
+
+    /// A vessel without a reported length still shows, and one without a
+    /// position cannot be placed.
+    #[test]
+    fn ais_vessels_without_length_or_position() {
+        let mut unplaced = vessel(0.0, 500.0, None);
+        unplaced.position = None;
+        let world = ais_world(&[vessel(0.0, 1000.0, None), unplaced]);
+
+        assert_eq!(world.ais.len(), 1);
+        assert!(echo_at(&world, 0.0, 1000.0).intensity > 0);
+        assert_eq!(
+            echo_at(&world, 0.0, 1000.0 + AIS_DEFAULT_RADIUS + 5.0),
+            Echo::NONE
+        );
+    }
+
+    /// A small boat far out spreads over the beam width, so it shows on
+    /// the spokes beside it too, as on a real radar.
+    #[test]
+    fn the_beam_spreads_a_small_vessel_over_neighbouring_spokes() {
+        let distance = 5_000.0;
+        let world = ais_world(&[vessel(0.8, distance, Some(10.0))]);
+        let (sin_b, cos_b) = (0.0, 1.0);
+        let shows = |half_beam| {
+            let boats = world.boats_on_spoke(sin_b, cos_b, half_beam);
+            (4950..5050).any(|d| world.echo_fast(sin_b, cos_b, d as f64, &boats).intensity > 0)
+        };
+
+        assert!(shows(HALF_BEAM));
+        assert!(
+            !shows(0.0),
+            "too far off the spoke without the beam's spread"
+        );
+    }
+
+    /// Between AIS reports a vessel moves on along its course.
+    #[test]
+    fn an_ais_vessel_moves_on_between_reports() {
+        let mut world = ais_world(&[vessel(180.0, 1000.0, Some(20.0))]);
+
+        world.update(20.0);
+        world.update_cache(&GeoPosition::new(OWN_SHIP.0, OWN_SHIP.1), 1.0);
+
+        assert!(echo_at(&world, 180.0, 900.0).intensity > 0);
+        assert_eq!(echo_at(&world, 180.0, 1000.0), Echo::NONE);
+    }
+
+    /// The store is read once per rotation, more often than most vessels
+    /// report, so a repeated report must not pull the echo back.
+    #[test]
+    fn a_repeated_ais_report_keeps_the_vessel_moving_on() {
+        let report = vessel(180.0, 1000.0, Some(20.0));
+        let mut world = ais_world(std::slice::from_ref(&report));
+
+        world.update(20.0);
+        world.set_ais_vessels(std::slice::from_ref(&report));
+        world.update_cache(&GeoPosition::new(OWN_SHIP.0, OWN_SHIP.1), 1.0);
+
+        assert!(echo_at(&world, 180.0, 900.0).intensity > 0);
+        assert_eq!(echo_at(&world, 180.0, 1000.0), Echo::NONE);
+    }
+
+    /// Following a boat far from the scenario rebuilds it there; the AIS
+    /// vessels must not vanish until the store is next read.
+    #[test]
+    fn rebuilding_the_world_keeps_the_ais_vessels() {
+        let mut world = ais_world(&[vessel(180.0, 1000.0, Some(20.0))]);
+
+        world.rebuild_around(GeoPosition::new(OWN_SHIP.0 + 1.0, OWN_SHIP.1));
+        world.update_cache(&GeoPosition::new(OWN_SHIP.0, OWN_SHIP.1), 1.0);
+
+        assert!(echo_at(&world, 180.0, 1000.0).intensity > 0);
+    }
+
+    /// A vessel's length often arrives in a later message than its
+    /// position, so the echo takes it up without waiting for a new position.
+    #[test]
+    fn an_ais_vessel_takes_up_a_newly_reported_length() {
+        let mut world = ais_world(&[vessel(180.0, 1000.0, None)]);
+        world.set_ais_vessels(&[vessel(180.0, 1000.0, Some(200.0))]);
+        world.update_cache(&GeoPosition::new(OWN_SHIP.0, OWN_SHIP.1), 1.0);
+
+        assert!(echo_at(&world, 180.0, 1080.0).intensity > 0);
+    }
+
+    #[test]
+    fn a_new_ais_report_moves_the_vessel_to_it() {
+        let mut world = ais_world(&[vessel(180.0, 1000.0, Some(20.0))]);
+
+        world.update(20.0);
+        world.set_ais_vessels(&[vessel(180.0, 1500.0, Some(20.0))]);
+        world.update_cache(&GeoPosition::new(OWN_SHIP.0, OWN_SHIP.1), 1.0);
+
+        assert!(echo_at(&world, 180.0, 1500.0).intensity > 0);
+        assert_eq!(echo_at(&world, 180.0, 900.0), Echo::NONE);
+    }
+
+    /// The test scenario is laid out around the emulator's own boat, so it
+    /// disappears while the emulator follows a boat sailing elsewhere.
+    #[test]
+    fn the_test_scenario_can_be_hidden() {
+        let own = GeoPosition::new(OWN_SHIP.0, OWN_SHIP.1);
+        let mut world = EmulatorWorld::new(own);
+        let land_bearing = 180.0 + LAND_DISTANCE_WEST.atan2(LAND_DISTANCE_SOUTH).to_degrees();
+        let land_distance = LAND_DISTANCE_WEST.hypot(LAND_DISTANCE_SOUTH);
+        world.update_cache(&own, 1.0);
+        assert!(echo_at(&world, land_bearing, land_distance).intensity > 0);
+
+        world.show_test_scenario(false);
+        world.update_cache(&own, 1.0);
+        assert_eq!(echo_at(&world, land_bearing, land_distance), Echo::NONE);
     }
 
     #[test]
