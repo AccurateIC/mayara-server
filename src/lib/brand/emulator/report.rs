@@ -570,7 +570,6 @@ mod tests {
         }
     }
 
-    /// A range outside the emulator's own is held to the nearest one it has.
     #[test]
     fn a_range_request_is_held_to_the_emulators_ranges() {
         let shortest = *EMULATOR_RANGES.first().unwrap() as u32;
