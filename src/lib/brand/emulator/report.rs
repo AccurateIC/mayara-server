@@ -478,11 +478,16 @@ fn place_boat(
     (position, source_heading.map_or(heading, f64::to_degrees))
 }
 
+/// Spokes paint past the range setting by this ratio, like a HALO.
+const SPOKE_COVERAGE_NUMERATOR: u64 = 3;
+const SPOKE_COVERAGE_DENOMINATOR: u64 = 2;
+
 /// The distance a spoke covers, in meters. Like a HALO, the emulator paints
 /// past the range setting, and it reports the distance its spokes actually
 /// reach so that every echo is drawn where it is.
 fn spoke_range(range: u32) -> u32 {
-    u32::try_from(u64::from(range) * 3 / 2).unwrap_or(u32::MAX)
+    u32::try_from(u64::from(range) * SPOKE_COVERAGE_NUMERATOR / SPOKE_COVERAGE_DENOMINATOR)
+        .unwrap_or(u32::MAX)
 }
 
 /// The distance one pixel of a spoke covers at this range setting, in meters.
