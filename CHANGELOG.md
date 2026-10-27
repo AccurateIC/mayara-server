@@ -5,6 +5,37 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 3.16.0 (2026-10-27)
+
+<!-- Release notes generated using configuration in .github/release.yml at main -->
+
+## What's Changed
+### 🚀 Features
+* feat(furuno): report lost radar signals and supply rails by @keesverruijt in https://github.com/MarineYachtRadar/mayara-server/pull/789
+* feat(emulator): add an option to send sparse spokes by @keesverruijt in https://github.com/MarineYachtRadar/mayara-server/pull/795
+* feat(emulator): colour moving targets in Doppler mode by @keesverruijt in https://github.com/MarineYachtRadar/mayara-server/pull/797
+* feat(furuno): add auto sea mode and echo averaging by @keesverruijt in https://github.com/MarineYachtRadar/mayara-server/pull/800
+* feat(furuno): send the vessel's heading to the radar by @keesverruijt in https://github.com/MarineYachtRadar/mayara-server/pull/801
+* feat(emulator): follow the boat's position from Signal K by @dirkwa in https://github.com/MarineYachtRadar/mayara-server/pull/811
+* feat(emulator): show AIS vessels as radar echoes by @dirkwa in https://github.com/MarineYachtRadar/mayara-server/pull/813
+### 🐛 Fixes
+* fix(furuno): identify a DRS2D-NXT as one by @keesverruijt in https://github.com/MarineYachtRadar/mayara-server/pull/788
+* fix(gui): fill spoke gaps only on radars that skip spokes by @dirkwa in https://github.com/MarineYachtRadar/mayara-server/pull/793
+* fix(emulator): keep the emulator from going off after 30 s by @keesverruijt in https://github.com/MarineYachtRadar/mayara-server/pull/796
+* fix(radar): offer spoke processing only on radars that skip spokes by @keesverruijt in https://github.com/MarineYachtRadar/mayara-server/pull/794
+* fix(furuno): fix settings on DRS-NXT radars by @keesverruijt in https://github.com/MarineYachtRadar/mayara-server/pull/791
+* fix(furuno): offer the controls each pre-NXT DRS applies by @keesverruijt in https://github.com/MarineYachtRadar/mayara-server/pull/792
+* fix(furuno): use the heading the radar sends with its spokes by @keesverruijt in https://github.com/MarineYachtRadar/mayara-server/pull/802
+* fix(arpa): check track timeouts every revolution by @keesverruijt in https://github.com/MarineYachtRadar/mayara-server/pull/803
+* fix(furuno): take each spoke frame's range unit from the frame by @keesverruijt in https://github.com/MarineYachtRadar/mayara-server/pull/805
+* fix(furuno): plot echoes at the right distance in statute miles and kiloyards by @keesverruijt in https://github.com/MarineYachtRadar/mayara-server/pull/809
+* fix(emulator): draw echoes at their real distance by @dirkwa in https://github.com/MarineYachtRadar/mayara-server/pull/812
+### 📦 Dependencies
+* build(deps): bump the cargo-minor-patch group with 5 updates by @dependabot[bot] in https://github.com/MarineYachtRadar/mayara-server/pull/807
+
+
+**Full Changelog**: https://github.com/MarineYachtRadar/mayara-server/compare/v3.15.0...v3.16.0
+
 ## 3.15.0 (2026-10-19)
 
 <!-- Release notes generated using configuration in .github/release.yml at main -->
