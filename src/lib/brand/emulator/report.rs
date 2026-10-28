@@ -52,10 +52,7 @@ pub(crate) struct EmulatorReportReceiver {
     world: EmulatorWorld,
     /// Where the test scenario in `world` was built around
     world_origin: GeoPosition,
-    /// Land from `--emulator-land`
-    coast: Option<Coast>,
-    /// Where each spoke, by true bearing, lies over that land
-    coast_spokes: Vec<Vec<(f64, f64)>>,
+    coast: CoastView,
     boat_position: GeoPosition,
     boat_heading: f64,  // degrees
     boat_speed: f64,    // knots
@@ -115,8 +112,7 @@ impl EmulatorReportReceiver {
             command_sender,
             world,
             world_origin: initial_pos,
-            coast,
-            coast_spokes: Vec::new(),
+            coast: CoastView::new(coast),
             boat_position: initial_pos,
             boat_heading: heading,
             boat_speed: speed,
@@ -487,7 +483,7 @@ impl EmulatorReportReceiver {
 
         let meters_per_pixel = meters_per_pixel(self.current_range);
         let boats = self.world.boats_on_spoke(sin_b, cos_b, HALF_BEAM_WIDTH);
-        let land = self.coast_on(world_bearing_rad);
+        let land = self.coast.on(world_bearing_rad);
 
         // Generate spoke data directly as bytes (one byte per pixel, 4-bit intensity)
         let mut data: Vec<u8> = Vec::with_capacity(EMULATOR_SPOKE_LEN);
@@ -516,23 +512,42 @@ impl EmulatorReportReceiver {
 
     /// Work out where the spokes cross land from where the boat now is.
     fn refresh_coast(&mut self) {
+        self.coast
+            .refresh(&self.boat_position, spoke_range(self.current_range) as f64);
+    }
+}
+
+/// Land from `--emulator-land`, and where each spoke, by true bearing, lies
+/// over it as last seen from the boat
+struct CoastView {
+    coast: Option<Coast>,
+    spokes: Vec<Vec<(f64, f64)>>,
+}
+
+impl CoastView {
+    fn new(coast: Option<Coast>) -> Self {
+        CoastView {
+            coast,
+            spokes: Vec::new(),
+        }
+    }
+
+    /// Work out where the spokes, reaching `reach` meters, cross land from
+    /// the boat at `boat`.
+    fn refresh(&mut self, boat: &GeoPosition, reach: f64) {
         if let Some(coast) = &self.coast {
-            self.coast_spokes = coast.spokes(
-                &self.boat_position,
-                EMULATOR_SPOKES,
-                spoke_range(self.current_range) as f64,
-            );
+            self.spokes = coast.spokes(boat, EMULATOR_SPOKES, reach);
         }
     }
 
     /// The land a spoke at this true bearing, in radians, passes over.
-    fn coast_on(&self, bearing: f64) -> &[(f64, f64)] {
-        if self.coast_spokes.is_empty() {
+    fn on(&self, bearing: f64) -> &[(f64, f64)] {
+        if self.spokes.is_empty() {
             return &[];
         }
         let spoke = (bearing.rem_euclid(TAU) / TAU * EMULATOR_SPOKES as f64).round() as usize
             % EMULATOR_SPOKES;
-        &self.coast_spokes[spoke]
+        &self.spokes[spoke]
     }
 }
 
@@ -630,6 +645,71 @@ impl DopplerColors {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A coast view whose spoke `i` lies over land from `i` meters on, so a
+    /// lookup shows which spoke it picked.
+    fn numbered_spokes() -> CoastView {
+        CoastView {
+            coast: None,
+            spokes: (0..EMULATOR_SPOKES)
+                .map(|i| vec![(i as f64, i as f64 + 1.0)])
+                .collect(),
+        }
+    }
+
+    fn spoke_picked(view: &CoastView, bearing: f64) -> usize {
+        view.on(bearing)[0].0 as usize
+    }
+
+    /// Bearings pick the nearest spoke, and a bearing a whole turn on, or
+    /// just short of one, is the same as north.
+    #[test]
+    fn a_bearing_picks_the_nearest_spoke() {
+        let view = numbered_spokes();
+        let step = TAU / EMULATOR_SPOKES as f64;
+
+        assert_eq!(spoke_picked(&view, 0.0), 0);
+        assert_eq!(spoke_picked(&view, PI / 2.0), EMULATOR_SPOKES / 4);
+        assert_eq!(spoke_picked(&view, TAU - step), EMULATOR_SPOKES - 1);
+        assert_eq!(spoke_picked(&view, TAU - step / 10.0), 0);
+        assert_eq!(spoke_picked(&view, TAU + step), 1);
+        assert_eq!(spoke_picked(&view, -step), EMULATOR_SPOKES - 1);
+    }
+
+    /// Without `--emulator-land`, or before the first refresh, no spoke
+    /// passes over land, and a refresh leaves it so.
+    #[test]
+    fn without_land_no_spoke_passes_over_any() {
+        let mut view = CoastView::new(None);
+        assert!(view.on(0.0).is_empty());
+
+        view.refresh(&GeoPosition::new(53.2, 5.3), 3000.0);
+        assert!(view.on(1.0).is_empty());
+    }
+
+    /// A refresh works the spokes out from where the boat now is: land
+    /// north of the boat shows ahead on the north spoke and behind on the
+    /// south one once the boat has sailed past it.
+    #[test]
+    fn a_refresh_follows_the_boat() {
+        let land = serde_json::json!({
+            "type": "Polygon",
+            "coordinates": [[[5.29, 53.21], [5.31, 53.21], [5.31, 53.22], [5.29, 53.22], [5.29, 53.21]]]
+        });
+        let path =
+            std::env::temp_dir().join(format!("mayara-coast-{}.geojson", std::process::id()));
+        std::fs::write(&path, land.to_string()).unwrap();
+        let mut view = CoastView::new(Some(Coast::load(&path).unwrap()));
+        std::fs::remove_file(&path).unwrap();
+
+        view.refresh(&GeoPosition::new(53.2, 5.3), 3000.0);
+        assert!(!view.on(0.0).is_empty(), "land ahead to the north");
+        assert!(view.on(PI).is_empty());
+
+        view.refresh(&GeoPosition::new(53.23, 5.3), 3000.0);
+        assert!(view.on(0.0).is_empty());
+        assert!(!view.on(PI).is_empty(), "land behind to the south");
+    }
 
     /// Spokes reach half as far again as the range, rounded down to whole
     /// meters, and the pixels span exactly that reach.
