@@ -197,6 +197,8 @@ impl EmulatorReportReceiver {
                         Ok(Power::Transmit) => {
                             log::info!("{}: Starting transmission", self.common.key);
                             self.transmitting = true;
+                            // The boat moved on while no rotation refreshed it
+                            self.refresh_coast();
                             self.common
                                 .set_value(&ControlId::Power, Power::Transmit as i32 as f64);
                         }
