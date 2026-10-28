@@ -490,13 +490,8 @@ impl EmulatorReportReceiver {
 
         for pixel in 0..EMULATOR_SPOKE_LEN {
             let distance = pixel as f64 * meters_per_pixel;
-            if land.iter().any(|&(enter, leave)| {
-                distance >= enter && distance < leave.min(enter + LAND_DEPTH)
-            }) {
-                data.push(LAND_INTENSITY);
-                continue;
-            }
-            data.push(doppler.pixel(self.world.echo_fast(sin_b, cos_b, distance, &boats)));
+            let echo = self.world.echo_fast(sin_b, cos_b, distance, &boats);
+            data.push(doppler.pixel(with_land(echo, distance, land)));
         }
 
         data
@@ -514,6 +509,23 @@ impl EmulatorReportReceiver {
     fn refresh_coast(&mut self) {
         self.coast
             .refresh(&self.boat_position, spoke_range(self.current_range) as f64);
+    }
+}
+
+/// The echo at `distance` meters along a spoke whose stretches over land
+/// are `land`: the land's return, unless `echo` is stronger, as a ship
+/// alongside a quay is.
+fn with_land(echo: Echo, distance: f64, land: &[(f64, f64)]) -> Echo {
+    let on_land = land
+        .iter()
+        .any(|&(enter, leave)| distance >= enter && distance < leave.min(enter + LAND_DEPTH));
+    if on_land && echo.intensity < LAND_INTENSITY {
+        Echo {
+            intensity: LAND_INTENSITY,
+            closing_speed: 0.0,
+        }
+    } else {
+        echo
     }
 }
 
@@ -795,6 +807,51 @@ mod tests {
             intensity: 14,
             closing_speed,
         }
+    }
+
+    const NO_ECHO: Echo = Echo {
+        intensity: 0,
+        closing_speed: 0.0,
+    };
+
+    /// Land returns from where the beam reaches it, for `LAND_DEPTH` meters
+    /// or to where it leaves the land, whichever comes first.
+    #[test]
+    fn land_returns_from_the_shore_to_its_depth() {
+        let land = [(1000.0, 5000.0), (8000.0, 8100.0)];
+
+        assert_eq!(with_land(NO_ECHO, 999.0, &land).intensity, 0);
+        assert_eq!(with_land(NO_ECHO, 1000.0, &land).intensity, LAND_INTENSITY);
+        assert_eq!(
+            with_land(NO_ECHO, 1000.0 + LAND_DEPTH - 1.0, &land).intensity,
+            LAND_INTENSITY
+        );
+        assert_eq!(with_land(NO_ECHO, 1000.0 + LAND_DEPTH, &land).intensity, 0);
+        assert_eq!(with_land(NO_ECHO, 8050.0, &land).intensity, LAND_INTENSITY);
+        assert_eq!(with_land(NO_ECHO, 8100.0, &land).intensity, 0);
+    }
+
+    /// Off land, and on a spoke without any, the echo passes unchanged.
+    #[test]
+    fn an_echo_off_land_passes_unchanged() {
+        assert_eq!(with_land(echo(2.0), 500.0, &[]), echo(2.0));
+        assert_eq!(with_land(echo(2.0), 500.0, &[(1000.0, 2000.0)]), echo(2.0));
+    }
+
+    /// A ship stronger than the land shows on it, Doppler colour and all;
+    /// a weaker one disappears into the land's return.
+    #[test]
+    fn a_ship_stronger_than_the_land_shows_on_it() {
+        let land = [(1000.0, 2000.0)];
+        let both = colors(DopplerMode::Both);
+
+        assert_eq!(both.pixel(with_land(echo(2.0), 1100.0, &land)), 40);
+        assert_eq!(both.pixel(with_land(echo(0.0), 1100.0, &land)), 14);
+        let weak = Echo {
+            intensity: LAND_INTENSITY - 1,
+            closing_speed: 2.0,
+        };
+        assert_eq!(both.pixel(with_land(weak, 1100.0, &land)), LAND_INTENSITY);
     }
 
     fn colors(mode: DopplerMode) -> DopplerColors {
