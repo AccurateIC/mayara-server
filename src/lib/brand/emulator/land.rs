@@ -330,4 +330,55 @@ mod tests {
 
         assert!(Coast::load(&path).is_err());
     }
+
+    /// Every GeoJSON root a chart export may use loads, other geometries in
+    /// it are skipped, and a ring left open is closed.
+    #[test]
+    fn supported_geojson_roots_are_loaded_and_open_rings_are_closed() {
+        let square = json!([
+            [5.0, 53.0],
+            [5.1, 53.0],
+            [5.1, 53.1],
+            [5.0, 53.1],
+            [5.0, 53.0]
+        ]);
+        let open = json!([[6.0, 53.0], [6.1, 53.0], [6.1, 53.1]]);
+        let cases = [
+            (
+                "polygon",
+                json!({"type": "Polygon", "coordinates": [square]}),
+                1,
+            ),
+            (
+                "multipolygon",
+                json!({"type": "MultiPolygon", "coordinates": [[square], [open]]}),
+                2,
+            ),
+            (
+                "collection",
+                json!({"type": "GeometryCollection", "geometries": [
+                    {"type": "Point", "coordinates": [5.0, 53.0]},
+                    {"type": "Polygon", "coordinates": [open]}
+                ]}),
+                1,
+            ),
+            (
+                "feature",
+                json!({"type": "Feature", "properties": {}, "geometry":
+                    {"type": "Polygon", "coordinates": [square, open]}}),
+                2,
+            ),
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        for (name, geojson, rings) in cases {
+            let path = dir.path().join(format!("{name}.geojson"));
+            std::fs::write(&path, geojson.to_string()).unwrap();
+
+            let coast = Coast::load(&path).unwrap();
+            assert_eq!(coast.rings.len(), rings, "{name}");
+            for ring in &coast.rings {
+                assert_eq!(ring.first(), ring.last(), "{name}: ring closed");
+            }
+        }
+    }
 }
