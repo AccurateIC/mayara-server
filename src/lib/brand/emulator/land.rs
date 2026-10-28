@@ -9,6 +9,8 @@ use serde_json::Value;
 use crate::radar::GeoPosition;
 
 const METERS_PER_DEGREE_LAT: f64 = 111_320.0;
+const HALF_LONGITUDE_DEGREES: f64 = 180.0;
+const FULL_LONGITUDE_DEGREES: f64 = 360.0;
 
 /// How far into land the radar sees from where its beam reaches the coast,
 /// in meters. Low land behind the shore line returns little.
@@ -54,7 +56,11 @@ impl Coast {
         let meters_per_degree_lon = METERS_PER_DEGREE_LAT * boat.lat().to_radians().cos();
         let to_local = |&(lon, lat): &(f64, f64)| {
             (
-                (lon - boat.lon()) * meters_per_degree_lon,
+                // The short way round, so land across the antimeridian, as
+                // off Fiji, lies beside the boat rather than a world away
+                ((lon - boat.lon() + HALF_LONGITUDE_DEGREES).rem_euclid(FULL_LONGITUDE_DEGREES)
+                    - HALF_LONGITUDE_DEGREES)
+                    * meters_per_degree_lon,
                 (lat - boat.lat()) * METERS_PER_DEGREE_LAT,
             )
         };
@@ -249,6 +255,26 @@ mod tests {
             assert_eq!(beam[0].0, 0.0, "{beam:?}");
             assert!((beam[0].1 - 500.0).abs() < 1.0, "{beam:?}");
         }
+    }
+
+    /// Land just across the antimeridian shows where it lies, east of a boat
+    /// just west of it.
+    #[test]
+    fn land_across_the_antimeridian_lies_beside_the_boat() {
+        let square = json!({
+            "type": "Polygon",
+            "coordinates": [[
+                [-179.99, -17.01], [-179.98, -17.01], [-179.98, -16.99],
+                [-179.99, -16.99], [-179.99, -17.01]
+            ]]
+        });
+        let spokes =
+            Coast::from_geojson(&square).spokes(&GeoPosition::new(-17.0, 179.99), SPOKES, 5000.0);
+
+        let east = &spokes[SPOKES / 4];
+        assert_eq!(east.len(), 1, "{east:?}");
+        assert!(east[0].0 > 1000.0 && east[0].0 < 3000.0, "{east:?}");
+        assert!(spokes[3 * SPOKES / 4].is_empty(), "nothing to the west");
     }
 
     /// The beam heading for the land enters it at its near edge and leaves
